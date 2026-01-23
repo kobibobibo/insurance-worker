@@ -1,0 +1,26 @@
+{
+  "name": "insurance-policy-worker",
+  "version": "1.0.0",
+  "description": "Background worker for processing insurance policy documents",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "keywords": [
+    "insurance",
+    "policy",
+    "worker",
+    "background-job"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "@upstash/redis": "^1.28.0",
+    "pdf-parse": "^1.1.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
