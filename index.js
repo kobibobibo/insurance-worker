@@ -6,6 +6,7 @@
 const { Redis } = require('@upstash/redis');
 const { createClient } = require('@supabase/supabase-js');
 const pdf = require('pdf-parse');
+import { randomUUID } from 'crypto';
 
 // Initialize clients
 const redis = new Redis({
@@ -377,7 +378,7 @@ function extractBenefits(text, document_id) {
     const quote = match[0].substring(0, 200); // Max 200 chars
     
     benefits.push({
-      benefit_id: `${document_id}_${benefits.length}`,
+      benefit_id: randomUUID(),
       layer: 'certain', // Default to certain
       title: quote.substring(0, 100),
       summary: quote,
