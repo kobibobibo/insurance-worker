@@ -62,7 +62,26 @@ async function processJob(job) {
   const { run_id, retry_count = 0 } = job;
 
   try {
-    console.log(`\n🔧 Processing run: ${run_id}`);
+    console.log(`\n🔧 Checking run: ${run_id}`);
+
+    // Check if already completed (skip duplicate jobs)
+    const { data: existingRun, error: fetchError } = await supabase
+      .from('runs')
+      .select('status')
+      .eq('run_id', run_id)
+      .single();
+    
+    if (fetchError) {
+      console.error(`❌ Failed to fetch run status:`, fetchError);
+      throw fetchError;
+    }
+
+    if (existingRun?.status === 'completed') {
+      console.log(`⏭️  Skipping already completed run: ${run_id}`);
+      return; // Skip this job
+    }
+
+    console.log(`🔧 Processing run: ${run_id}`);
 
     // Update status to running
     await updateRunStatus(run_id, 'running', 'intake');
