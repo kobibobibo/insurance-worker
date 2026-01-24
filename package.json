@@ -1,6 +1,7 @@
 {
   "name": "insurance-policy-worker",
   "version": "1.0.0",
+  "type": "module",
   "description": "Background worker for processing insurance policy documents",
   "main": "index.js",
   "scripts": {

@@ -3,9 +3,9 @@
  * Consumes jobs from Upstash Redis queue and processes policy documents
  */
 
-const { Redis } = require('@upstash/redis');
-const { createClient } = require('@supabase/supabase-js');
-const pdf = require('pdf-parse');
+import { Redis } from '@upstash/redis';
+import { createClient } from '@supabase/supabase-js';
+import pdf from 'pdf-parse';
 import { randomUUID } from 'crypto';
 
 // Initialize clients
