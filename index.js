@@ -65,11 +65,16 @@ async function processJob(job) {
       .from('runs')
       .select('status')
       .eq('run_id', run_id)
-      .single();
+      .maybeSingle();
     
     if (fetchError) {
       console.error(`❌ Failed to fetch run status:`, fetchError);
       throw fetchError;
+    }
+
+    if (!existingRun) {
+      console.log(`⚠️ Run not found: ${run_id} - may have been deleted`);
+      return; // Skip this job
     }
 
     if (existingRun?.status === 'completed') {
