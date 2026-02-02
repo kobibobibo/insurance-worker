@@ -1,685 +1,930 @@
 /**
  * Insurance Policy Processing Worker
- * Consumes jobs from Upstash Redis queue and processes policy documents
+ * 
+ * Complete worker with clause-level citation extraction.
+ * Polls Redis queue and processes policy documents through 6-stage pipeline.
  */
 
-import { Redis } from '@upstash/redis';
 import { createClient } from '@supabase/supabase-js';
+import { Redis } from '@upstash/redis';
 import pdf from 'pdf-parse';
-import { randomUUID } from 'crypto';
+import { v4 as uuidv4 } from 'uuid';
 
-// Initialize clients
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+// ============================================================
+// CONFIGURATION
+// ============================================================
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// Configuration
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+const redis = new Redis({ url: REDIS_URL, token: REDIS_TOKEN });
+
 const QUEUE_NAME = 'policy-processing';
-const POLL_INTERVAL = 2000;
+const POLL_INTERVAL = 5000;
 const MAX_RETRIES = 3;
 
-// ═══════════════════════════════════════════════════════
-// CLAUSE EXTRACTION UTILITIES (add after MAX_RETRIES)
-// ═══════════════════════════════════════════════════════
+// ============================================================
+// CLAUSE EXTRACTION PATTERNS (from clauseExtraction.ts)
+// ============================================================
 
-const CLAUSE_PATTERNS = [
-  /סעיף\s*([\d\.]+(?:\s*[א-ת])?)/gi,
-  /פרק\s*([\d\.]+(?:\s*[א-ת])?)/gi,
-  /section\s*([\d\.]+[a-z]?)/gi,
-  /clause\s*([\d\.]+[a-z]?)/gi,
-];
+const CLAUSE_PATTERNS = {
+  hebrew: {
+    section: /סעיף\s*(קטן\s*)?([\u05D0-\u05EAd\d][\d\.\u05D0-\u05EA]*)/g,
+    chapter: /פרק\s*([\u05D0-\u05EA\d]+)/g,
+    condition: /תנאי\s*([\d\.]+)/g,
+    annex: /נספח\s*([\u05D0-\u05EA\d]+)/g,
+    exclusion: /חריג\s*([\u05D0-\u05EA\d]+)/g,
+    definition: /הגדרה\s*([\d\.]+)/g,
+  },
+  english: {
+    section: /(?:Section|Sec\.?)\s*([\d]+(?:\.[\d]+)*(?:\.[a-z])?)/gi,
+    clause: /(?:Clause|Cl\.?)\s*([\d]+(?:\.[\d]+)*(?:\.[a-z])?)/gi,
+    article: /Article\s*([\d]+(?:\.[\d]+)*)/gi,
+    paragraph: /(?:Paragraph|Para\.?)\s*([\d]+(?:\.[\d]+)*)/gi,
+    appendix: /(?:Appendix|App\.?|Annex|Rider|Endorsement)\s*([A-Z\d]+)/gi,
+    exclusion: /Exclusion\s*([\d]+)/gi,
+    definition: /Definition\s*([\d]+(?:\.[\d]+)*)/gi,
+  },
+};
 
-const RIGHT_KEYWORDS = ['זכאי', 'זכאית', 'מכוסה', 'ישולם', 'יכוסה', 'entitled', 'covered', 'payable'];
+const HEADING_PATTERNS = {
+  colonEnding: /^(.{3,60}):\s*$/m,
+  hebrew: {
+    common: /^(כיסוי|הגדרות|חריגים|תנאים|הוראות|זכויות|חובות|תביעות|ביטול|שינויים)\s/,
+    numbered: /^[\u05D0-\u05EA\d]+[\.\)]\s+(.{3,50})$/m,
+  },
+  english: {
+    allCaps: /^([A-Z][A-Z\s]{10,50})$/m,
+    titleCase: /^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,6})$/m,
+    numbered: /^[\d]+[\.\)]\s+([A-Z][A-Za-z\s]{3,50})$/m,
+  },
+};
 
-function extractClauseNumber(text, quotePosition) {
-  let nearest = null;
-  for (const pattern of CLAUSE_PATTERNS) {
-    pattern.lastIndex = 0;
+const RIGHT_KEYWORDS = {
+  hebrew: [
+    'זכאי', 'זכאית', 'יהיה זכאי', 'תהיה זכאית',
+    'כיסוי', 'יכוסה', 'מכוסה', 'יכסה',
+    'החזר', 'יוחזר', 'להחזיר',
+    'פיצוי', 'יפוצה', 'לפצות',
+    'תשלום', 'ישולם', 'לשלם',
+    'שיפוי', 'ישופה', 'לשפות',
+    'יינתן', 'תינתן', 'ניתן ל',
+    'רשאי', 'רשאית', 'מותר',
+  ],
+  english: [
+    'entitled', 'shall be entitled', 'will be entitled',
+    'covered', 'shall cover', 'will cover', 'coverage',
+    'reimburse', 'reimbursement', 'shall reimburse',
+    'compensate', 'compensation', 'shall compensate',
+    'payment', 'shall pay', 'will pay',
+    'indemnify', 'indemnification',
+    'benefit', 'shall provide', 'will provide',
+    'eligible', 'eligibility',
+  ],
+};
+
+const ANNEX_PATTERNS = {
+  hebrew: [/נספח/, /תוספת/, /רשימה/, /דף פרטים/, /הרחבה/],
+  english: [/annex/i, /appendix/i, /rider/i, /endorsement/i, /schedule/i, /addendum/i, /supplement/i],
+};
+
+// ============================================================
+// CLAUSE EXTRACTION FUNCTIONS
+// ============================================================
+
+function extractClauseReferences(text) {
+  if (!text) return [];
+  const references = [];
+  
+  // Process Hebrew patterns
+  for (const [type, pattern] of Object.entries(CLAUSE_PATTERNS.hebrew)) {
+    const regex = new RegExp(pattern.source, pattern.flags);
     let match;
-    while ((match = pattern.exec(text)) !== null) {
-      const distance = Math.abs(match.index - quotePosition);
-      if (!nearest || distance < nearest.distance) {
-        nearest = { number: match[1].trim(), distance };
-      }
-    }
-  }
-  return nearest?.number;
-}
-
-function extractHeadingTitle(text, quotePosition) {
-  const textBefore = text.substring(0, quotePosition);
-  const lines = textBefore.split('\n').reverse();
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.endsWith(':') && trimmed.length > 5 && trimmed.length < 80) {
-      return trimmed.slice(0, -1);
-    }
-    if (/^[א-ת\d\.]+\.\s+/.test(trimmed) && trimmed.length < 60) {
-      return trimmed;
-    }
-  }
-  return undefined;
-}
-
-function extractHighlightedText(text, quote) {
-  const quoteStart = text.indexOf(quote);
-  if (quoteStart === -1) return undefined;
-  const contextStart = Math.max(0, quoteStart - 200);
-  const contextEnd = Math.min(text.length, quoteStart + quote.length + 200);
-  const sentences = text.substring(contextStart, contextEnd).split(/[.。]\s+/);
-  for (const sentence of sentences) {
-    if (RIGHT_KEYWORDS.some(kw => sentence.includes(kw)) && sentence.length > 20) {
-      return sentence.trim() + '.';
-    }
-  }
-  return undefined;
-}
-
-function extractExcerptContext(text, quote) {
-  const quoteStart = text.indexOf(quote);
-  if (quoteStart === -1) return quote;
-  const start = Math.max(0, quoteStart - 100);
-  const end = Math.min(text.length, quoteStart + quote.length + 100);
-  let excerpt = text.substring(start, end);
-  if (start > 0) excerpt = '...' + excerpt;
-  if (end < text.length) excerpt += '...';
-  return excerpt;
-}
-
-
-/**
- * Main worker loop - polls Redis queue for jobs
- */
-async function startWorker() {
-  console.log('🚀 Insurance Policy Worker Started');
-  console.log('📋 Queue:', QUEUE_NAME);
-  console.log('⏱️  Poll Interval:', POLL_INTERVAL, 'ms');
-  console.log('🔄 Max Retries:', MAX_RETRIES);
-  console.log('─'.repeat(50));
-
-  while (true) {
-    try {
-      const jobData = await redis.lpop(QUEUE_NAME);
-
-      if (jobData) {
-        const job = typeof jobData === 'string' ? JSON.parse(jobData) : jobData;
-        console.log(`\n📥 New job received:`, job);
-        await processJob(job);
-      } else {
-        await sleep(POLL_INTERVAL);
-      }
-    } catch (error) {
-      console.error('❌ Worker error:', error);
-      await sleep(POLL_INTERVAL);
-    }
-  }
-}
-
-/**
- * Process a single job
- */
-async function processJob(job) {
-  const { run_id, retry_count = 0 } = job;
-
-  try {
-    console.log(`\n🔧 Checking run: ${run_id}`);
-
-    const { data: existingRun, error: fetchError } = await supabase
-      .from('runs')
-      .select('status')
-      .eq('run_id', run_id)
-      .maybeSingle();
-    
-    if (fetchError) {
-      console.error(`❌ Failed to fetch run status:`, fetchError);
-      throw fetchError;
-    }
-
-    if (!existingRun) {
-      console.log(`⚠️ Run not found: ${run_id} - may have been deleted`);
-      return; // Skip this job
-    }
-
-    if (existingRun?.status === 'completed') {
-      console.log(`⏭️  Skipping already completed run: ${run_id}`);
-      return;
-    }
-
-    console.log(`🔧 Processing run: ${run_id}`);
-    await updateRunStatus(run_id, 'running', 'intake');
-    await processPolicyPipeline(run_id);
-    await updateRunStatus(run_id, 'completed', 'export');
-    console.log(`✅ Job completed: ${run_id}`);
-
-  } catch (error) {
-    console.error(`❌ Job failed: ${run_id}`, error);
-
-    if (retry_count < MAX_RETRIES) {
-      console.log(`🔄 Retrying job (attempt ${retry_count + 1}/${MAX_RETRIES})`);
-      await redis.rpush(QUEUE_NAME, JSON.stringify({
-        ...job,
-        retry_count: retry_count + 1
-      }));
-    } else {
-      await updateRunStatus(run_id, 'failed', 'intake', {
-        error_code: 'max_retries_exceeded',
-        error_message: error.message
+    while ((match = regex.exec(text)) !== null) {
+      references.push({
+        type,
+        number: match[2] || match[1],
+        original: match[0],
+        language: 'hebrew',
+        position: match.index,
       });
     }
   }
-}
-
-/**
- * Main processing pipeline
- */
-async function processPolicyPipeline(run_id) {
-  console.log('\n📊 Pipeline Stages:');
-
-  // Stage 1: Intake
-  console.log('  1️⃣  Intake - Fetching documents...');
-  await updateRunStatus(run_id, 'running', 'intake');
-  const documents = await stageIntake(run_id);
-  console.log(`     ✓ Extracted ${documents.length} documents`);
-
-  // Stage 2: Map
-  console.log('  2️⃣  Map - Analyzing structure...');
-  await updateRunStatus(run_id, 'running', 'map');
-  const structure = await stageMap(run_id, documents);
-  console.log(`     ✓ Mapped ${Object.keys(structure).length} sections`);
-
-  // Stage 3: Harvest
-  console.log('  3️⃣  Harvest - Extracting rights...');
-  await updateRunStatus(run_id, 'running', 'harvest');
-  const benefits = await stageHarvest(run_id, documents, structure);
-  console.log(`     ✓ Found ${benefits.length} benefits`);
-
-  // Stage 4: Normalize
-  console.log('  4️⃣  Normalize - Standardizing data...');
-  await updateRunStatus(run_id, 'running', 'normalize');
-  const normalized = await stageNormalize(benefits);
-  console.log(`     ✓ Normalized ${normalized.length} benefits`);
-
-  // Stage 5: Validate
-  console.log('  5️⃣  Validate - Verifying evidence...');
-  await updateRunStatus(run_id, 'running', 'validate');
-  const validated = await stageValidate(run_id, normalized);
-  console.log(`     ✓ Validated with ${validated.coverage_ratio * 100}% evidence coverage`);
-
-  // Stage 6: Export
-  console.log('  6️⃣  Export - Generating exports...');
-  await updateRunStatus(run_id, 'running', 'export');
-  await stageExport(run_id);
-  console.log(`     ✓ Exports ready`);
-
-  console.log('\n✨ Pipeline completed successfully!\n');
-}
-
-/**
- * Stage 1: Intake - Fetch and extract document text
- */
-async function stageIntake(run_id) {
-  const { data: docs, error } = await supabase
-    .from('documents')
-    .select('*')
-    .eq('run_id', run_id);
-
-  if (error) throw error;
-  if (!docs || docs.length === 0) {
-    throw new Error('No documents found for this run');
+  
+  // Process English patterns
+  for (const [type, pattern] of Object.entries(CLAUSE_PATTERNS.english)) {
+    const regex = new RegExp(pattern.source, pattern.flags);
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      references.push({
+        type,
+        number: match[1],
+        original: match[0],
+        language: 'english',
+        position: match.index,
+      });
+    }
   }
+  
+  return references.sort((a, b) => a.position - b.position);
+}
 
-  const extractedDocs = [];
+function findNearestClause(fullText, quote) {
+  if (!fullText || !quote) return null;
+  const quotePosition = fullText.indexOf(quote);
+  if (quotePosition === -1) return null;
+  
+  const allRefs = extractClauseReferences(fullText);
+  if (allRefs.length === 0) return null;
+  
+  let nearest = null;
+  let nearestDistance = Infinity;
+  
+  for (const ref of allRefs) {
+    if (ref.position <= quotePosition) {
+      const distance = quotePosition - ref.position;
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearest = ref;
+      }
+    }
+  }
+  
+  return nearest;
+}
 
-  for (const doc of docs) {
-    console.log(`     📄 Processing: ${doc.display_name}`);
+function formatClauseReference(ref) {
+  if (!ref) return '';
+  const typeLabels = {
+    section: { he: 'סעיף', en: 'Section' },
+    chapter: { he: 'פרק', en: 'Chapter' },
+    clause: { he: 'סעיף', en: 'Clause' },
+    article: { he: 'סעיף', en: 'Article' },
+    paragraph: { he: 'פסקה', en: 'Paragraph' },
+    appendix: { he: 'נספח', en: 'Appendix' },
+    exclusion: { he: 'חריג', en: 'Exclusion' },
+    definition: { he: 'הגדרה', en: 'Definition' },
+    condition: { he: 'תנאי', en: 'Condition' },
+    annex: { he: 'נספח', en: 'Annex' },
+  };
+  
+  const label = typeLabels[ref.type] || { he: 'סעיף', en: 'Section' };
+  return ref.language === 'hebrew' 
+    ? `${label.he} ${ref.number}`
+    : `${label.en} ${ref.number}`;
+}
 
-    const { data: fileData, error: downloadError } = await supabase
-      .storage
-      .from('policy-documents')
-      .download(doc.storage_key);
-
-    if (downloadError) {
-      console.error(`     ⚠️  Failed to download: ${doc.display_name}`);
+function extractHeadings(text) {
+  if (!text) return [];
+  const headings = [];
+  const lines = text.split('\n');
+  let position = 0;
+  
+  for (const line of lines) {
+    const trimmed = line.trim();
+    
+    if (trimmed.length < 3) {
+      position += line.length + 1;
       continue;
     }
-
-    const buffer = await fileData.arrayBuffer();
-    const pdfData = await pdf(Buffer.from(buffer));
-
-    extractedDocs.push({
-      ...doc,
-      text: pdfData.text,
-      num_pages: pdfData.numpages,
-      page_texts: extractPageTexts(pdfData.text, pdfData.numpages)
-    });
-  }
-
-  return extractedDocs;
-}
-
-/**
- * Stage 2: Map - Analyze document structure
- */
-async function stageMap(run_id, documents) {
-  const structure = {};
-
-  for (const doc of documents) {
-    const sections = detectSections(doc.text);
     
-    structure[doc.document_id] = {
-      doc_type: doc.doc_type,
-      sections: sections,
-      has_schedule: detectSchedule(doc.text, doc.display_name)
-    };
-  }
-
-  const hasSchedule = Object.values(structure).some(s => s.has_schedule);
-  
-  if (!hasSchedule) {
-    await supabase
-      .from('runs')
-      .update({
-        missing_requirements: [{
-          code: 'schedule_required',
-          severity: 'warning',
-          message: 'נספח פרטי הביטוח חסר - סכומים לא יוצגו'
-        }]
-      })
-      .eq('run_id', run_id);
-  }
-
-  return structure;
-}
-
-/**
- * Stage 3: Harvest - Extract benefits with evidence
- */
-async function stageHarvest(run_id, documents, structure) {
-  const benefits = [];
-
-  for (const doc of documents) {
-    // Pass display_name and doc_type for enrichment
-    const foundBenefits = extractBenefits(
-      doc.text, 
-      doc.document_id, 
-      doc.page_texts,
-      doc.display_name,  // NEW
-      doc.doc_type       // NEW
-    );
-    benefits.push(...foundBenefits);
-  }
-
-  // ... rest unchanged
-}
-
-
-/**
- * Stage 4: Normalize - Standardize data
- */
-async function stageNormalize(benefits) {
-  return benefits.map(benefit => ({
-    ...benefit,
-    title: normalizeHebrewText(benefit.title),
-  }));
-}
-
-/**
- * Stage 5: Validate - Check evidence coverage
- */
-async function stageValidate(run_id, benefits) {
-  const benefitsWithEvidence = benefits.filter(
-    b => b.evidence_set && b.evidence_set.spans && b.evidence_set.spans.length > 0
-  );
-
-  const coverage_ratio = benefits.length > 0 
-    ? benefitsWithEvidence.length / benefits.length 
-    : 0;
-
-  await supabase
-    .from('runs')
-    .update({
-      quality_metrics: {
-        evidence_coverage_ratio: coverage_ratio,
-        benefits_count: benefits.length,
-        layer_distribution: calculateLayerDistribution(benefits),
-        warnings: coverage_ratio < 1.0 ? ['Some benefits missing evidence'] : []
+    if (HEADING_PATTERNS.colonEnding.test(trimmed)) {
+      headings.push({
+        text: trimmed.replace(/:$/, '').trim(),
+        level: 2,
+        position,
+        type: 'colon',
+      });
+    } else if (HEADING_PATTERNS.hebrew.numbered.test(trimmed)) {
+      const match = trimmed.match(HEADING_PATTERNS.hebrew.numbered);
+      if (match) {
+        headings.push({
+          text: match[1] || trimmed,
+          level: 2,
+          position,
+          type: 'numbered',
+        });
       }
-    })
-    .eq('run_id', run_id);
-
-  if (coverage_ratio < 1.0) {
-    throw new Error('Evidence coverage validation failed');
-  }
-
-  return { coverage_ratio };
-}
-
-/**
- * Stage 6: Export - Generate output files
- */
-async function stageExport(run_id) {
-  console.log('     📦 Export generation (placeholder)');
-}
-
-/**
- * Helper: Update run status in database
- */
-async function updateRunStatus(run_id, status, stage, extra = {}) {
-  const { error } = await supabase
-    .from('runs')
-    .update({
-      status,
-      stage,
-      updated_at: new Date().toISOString(),
-      ...extra
-    })
-    .eq('run_id', run_id);
-
-  if (error) {
-    console.error('Failed to update run status:', error);
-  }
-}
-
-/**
- * Helper: Extract page-level text from PDF
- */
-function extractPageTexts(fullText, numPages) {
-  const avgCharsPerPage = Math.ceil(fullText.length / numPages);
-  const pages = [];
-  
-  for (let i = 0; i < numPages; i++) {
-    const start = i * avgCharsPerPage;
-    const end = start + avgCharsPerPage;
-    pages.push(fullText.substring(start, end));
+    } else if (HEADING_PATTERNS.hebrew.common.test(trimmed)) {
+      headings.push({
+        text: trimmed,
+        level: 1,
+        position,
+        type: 'common',
+      });
+    } else if (HEADING_PATTERNS.english.allCaps.test(trimmed)) {
+      headings.push({
+        text: trimmed,
+        level: 1,
+        position,
+        type: 'caps',
+      });
+    } else if (HEADING_PATTERNS.english.numbered.test(trimmed)) {
+      const match = trimmed.match(HEADING_PATTERNS.english.numbered);
+      if (match) {
+        headings.push({
+          text: match[1],
+          level: 2,
+          position,
+          type: 'numbered',
+        });
+      }
+    }
+    
+    position += line.length + 1;
   }
   
-  return pages;
+  return headings;
 }
 
-/**
- * Helper: Detect sections in Hebrew text
- */
-function detectSections(text) {
-  const sectionPattern = /(?:חלק|סעיף|פרק)\s+[א-ת']+/g;
-  const matches = text.match(sectionPattern) || [];
-  return matches.map(m => ({ title: m, type: 'section' }));
-}
-
-/**
- * Helper: Detect if document is a schedule
- */
-function detectSchedule(text, filename) {
-  const scheduleKeywords = ['נספח', 'פרטי הביטוח', 'לוח תגמולים', 'schedule'];
-  const lowerText = text.toLowerCase();
-  const lowerFilename = filename.toLowerCase();
+function findNearestHeading(fullText, quote) {
+  if (!fullText || !quote) return null;
+  const quotePosition = fullText.indexOf(quote);
+  if (quotePosition === -1) return null;
   
-  return scheduleKeywords.some(keyword => 
-    lowerText.includes(keyword) || lowerFilename.includes(keyword)
-  );
+  const headings = extractHeadings(fullText.substring(0, quotePosition + 100));
+  if (headings.length === 0) return null;
+  
+  const headingsBefore = headings.filter(h => h.position < quotePosition);
+  return headingsBefore[headingsBefore.length - 1] || null;
 }
 
-/**
- * Helper: Classify benefit layer based on text content
- * Returns: 'certain' | 'conditional' | 'service'
- */
-function classifyBenefitLayer(text) {
-  const lowerText = text.toLowerCase();
+function extractParagraphAnchor(text, wordCount = 8) {
+  if (!text) return '';
+  const words = text
+    .replace(/[\n\r]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(w => w.length > 0);
   
-  // Conditional indicators - benefits that require conditions/approvals/waiting periods
-  const conditionalKeywords = [
-    // Hebrew
-    'בכפוף ל',
-    'באישור',
-    'לאחר תקופת המתנה',
-    'בתנאי ש',
-    'מותנה',
-    'תקופת אכשרה',
-    'לאחר אישור',
-    'טעון אישור',
-    'באישור מראש',
-    'בכפוף לאישור',
-    'תקופת המתנה',
-    'לאחר',
-    'ימי המתנה',
-    'חודשי המתנה',
-    'אם וכאשר',
-    'בהתקיים',
-    'ובלבד ש',
-    'למעט',
-    'אלא אם',
-    'בהתאם לשיקול דעת',
-    'עד לתקרה',
-    'מקסימום',
-    'עד',
-    'לא יותר מ',
-    // English
-    'subject to',
-    'pending approval',
-    'waiting period',
-    'conditional',
-    'upon approval',
-    'pre-authorization',
-    'requires approval',
-    'after',
-    'maximum',
-    'up to',
-    'not exceeding',
-    'provided that',
-    'unless',
-    'except'
+  return words.slice(0, wordCount).join(' ');
+}
+
+function findParagraphAnchor(fullText, quote) {
+  if (!fullText || !quote) return null;
+  const quotePosition = fullText.indexOf(quote);
+  if (quotePosition === -1) return null;
+  
+  let paragraphStart = fullText.lastIndexOf('\n\n', quotePosition);
+  if (paragraphStart === -1) paragraphStart = 0;
+  else paragraphStart += 2;
+  
+  const paragraphText = fullText.substring(paragraphStart, quotePosition + quote.length);
+  return extractParagraphAnchor(paragraphText);
+}
+
+function extractContext(fullText, quote, contextSize = 150) {
+  if (!fullText || !quote) return '';
+  const quotePosition = fullText.indexOf(quote);
+  if (quotePosition === -1) return '';
+  
+  const beforeStart = Math.max(0, quotePosition - contextSize);
+  const beforeText = fullText.substring(beforeStart, quotePosition);
+  
+  const sentenceStart = beforeText.lastIndexOf('.');
+  const contextStart = sentenceStart !== -1 ? beforeStart + sentenceStart + 1 : beforeStart;
+  
+  const afterEnd = Math.min(fullText.length, quotePosition + quote.length + contextSize);
+  const afterText = fullText.substring(quotePosition + quote.length, afterEnd);
+  
+  const sentenceEnd = afterText.indexOf('.');
+  const contextEnd = sentenceEnd !== -1 
+    ? quotePosition + quote.length + sentenceEnd + 1 
+    : afterEnd;
+  
+  return fullText.substring(contextStart, contextEnd).trim();
+}
+
+function findRightConferringSentence(quote) {
+  if (!quote) return null;
+  const sentences = quote.split(/[.。]/);
+  
+  for (const sentence of sentences) {
+    const trimmed = sentence.trim();
+    if (trimmed.length < 10) continue;
+    
+    for (const keyword of RIGHT_KEYWORDS.hebrew) {
+      if (trimmed.includes(keyword)) {
+        return trimmed;
+      }
+    }
+    
+    const lowerSentence = trimmed.toLowerCase();
+    for (const keyword of RIGHT_KEYWORDS.english) {
+      if (lowerSentence.includes(keyword)) {
+        return trimmed;
+      }
+    }
+  }
+  
+  const firstSentence = sentences.find(s => s.trim().length > 20);
+  return firstSentence?.trim() || null;
+}
+
+function isAnnexDocument(text) {
+  if (!text) return false;
+  for (const pattern of [...ANNEX_PATTERNS.hebrew, ...ANNEX_PATTERNS.english]) {
+    if (pattern.test(text)) return true;
+  }
+  return false;
+}
+
+function extractAnnexName(text) {
+  if (!text) return null;
+  const patterns = [
+    /נספח[:\s]+([^\n]{3,50})/,
+    /תוספת[:\s]+([^\n]{3,50})/,
+    /Annex\s*[A-Z\d]*[:\s]+([^\n]{3,50})/i,
+    /Appendix\s*[A-Z\d]*[:\s]+([^\n]{3,50})/i,
+    /Rider[:\s]+([^\n]{3,50})/i,
+    /Endorsement[:\s]+([^\n]{3,50})/i,
   ];
   
-  // Service indicators - assistance/support services (not direct payments)
-  const serviceKeywords = [
-    // Hebrew
-    'שירות',
-    'סיוע',
-    'ייעוץ',
-    'מוקד',
-    'תמיכה',
-    'הנחה',
-    'הטבה',
-    'שירותי רווחה',
-    'קו חם',
-    'מידע',
-    'הכוונה',
-    'ליווי',
-    'תיאום',
-    'הפניה',
-    'ייעוץ טלפוני',
-    'שירות לקוחות',
-    'מוקד שירות',
-    'סיוע טכני',
-    'תמיכה נפשית',
-    'ייעוץ רפואי',
-    'חוות דעת שנייה',
-    'second opinion',
-    // English
-    'service',
-    'assistance',
-    'helpline',
-    'support',
-    'hotline',
-    'consultation',
-    'guidance',
-    'coordination',
-    'referral',
-    'advisory',
-    'concierge',
-    'wellness',
-    'discount',
-    'benefit program'
-  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) {
+      return match[1].trim();
+    }
+  }
   
-  // Check for service indicators first (most specific)
-  if (serviceKeywords.some(kw => lowerText.includes(kw))) {
-    return 'service';
+  return null;
+}
+
+/**
+ * Enrich an evidence span with clause-level citations
+ */
+function enrichEvidenceSpan(pageText, quote, documentId, documentName, documentType, page, confidence) {
+  const clauseRef = findNearestClause(pageText || '', quote || '');
+  const heading = findNearestHeading(pageText || '', quote || '');
+  const paragraphAnchor = !clauseRef ? findParagraphAnchor(pageText || '', quote || '') : null;
+  const context = extractContext(pageText || '', quote || '');
+  const highlightedText = findRightConferringSentence(quote || '');
+  const isAnnex = documentType === 'endorsement' || isAnnexDocument(documentName || '');
+  const annexName = isAnnex ? extractAnnexName(pageText || '') || documentName : undefined;
+  
+  return {
+    evidence_id: uuidv4(),
+    document_id: documentId,
+    page: page || 1,
+    quote: quote || '',
+    confidence: confidence || 0.8,
+    section_path: clauseRef ? formatClauseReference(clauseRef) : undefined,
+    document_name: documentName || 'Unknown Document',
+    clause_number: clauseRef?.number,
+    heading_title: heading?.text,
+    paragraph_anchor: paragraphAnchor || undefined,
+    excerpt_context: context || undefined,
+    highlighted_text: highlightedText || undefined,
+    is_annex: isAnnex,
+    annex_name: annexName,
+    verbatim: true,
+  };
+}
+
+// ============================================================
+// TEXT PROCESSING UTILITIES
+// ============================================================
+
+function normalizeHebrewText(text) {
+  if (!text) return '';
+  return text
+    .replace(/\x00/g, '')
+    .replace(/[\u200E\u200F\u202A-\u202E\uFEFF]/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+}
+
+// ============================================================
+// BENEFIT EXTRACTION
+// ============================================================
+
+const BENEFIT_KEYWORDS = {
+  certain: [
+    'זכאי', 'זכאית', 'יכוסה', 'מכוסה', 'יוחזר', 'יפוצה',
+    'entitled', 'covered', 'reimbursed', 'compensated'
+  ],
+  conditional: [
+    'בתנאי', 'אם', 'במקרה', 'כאשר', 'בכפוף',
+    'if', 'when', 'provided that', 'subject to', 'conditional'
+  ],
+  service: [
+    'שירות', 'סיוע', 'ייעוץ', 'תמיכה', 'מוקד',
+    'service', 'assistance', 'support', 'helpline', 'concierge'
+  ]
+};
+
+function detectBenefitLayer(text) {
+  if (!text) return 'conditional';
+  const lowerText = text.toLowerCase();
+  
+  // Check for service indicators first
+  for (const keyword of BENEFIT_KEYWORDS.service) {
+    if (text.includes(keyword) || lowerText.includes(keyword)) {
+      return 'service';
+    }
   }
   
   // Check for conditional indicators
-  if (conditionalKeywords.some(kw => lowerText.includes(kw))) {
-    return 'conditional';
-  }
-  
-  // Default to certain (guaranteed rights)
-  return 'certain';
-}
-
-/**
- * Helper: Find the page number where a quote appears
- */
-function findPageForQuote(quote, pageTexts) {
-  if (!pageTexts || pageTexts.length === 0) return 1;
-  
-  const normalizedQuote = quote.substring(0, 50).toLowerCase();
-  
-  for (let i = 0; i < pageTexts.length; i++) {
-    if (pageTexts[i].toLowerCase().includes(normalizedQuote)) {
-      return i + 1; // Pages are 1-indexed
+  for (const keyword of BENEFIT_KEYWORDS.conditional) {
+    if (text.includes(keyword) || lowerText.includes(keyword)) {
+      return 'conditional';
     }
   }
   
-  return 1; // Default to page 1 if not found
+  // Check for certain indicators
+  for (const keyword of BENEFIT_KEYWORDS.certain) {
+    if (text.includes(keyword) || lowerText.includes(keyword)) {
+      return 'certain';
+    }
+  }
+  
+  return 'conditional';
 }
 
-
-
-function extractBenefits(text, document_id, pageTexts = [], docDisplayName = '', docType = 'policy') {
+function extractBenefits(text, documentId, pageTexts, displayName, docType) {
+  if (!text) return [];
+  
   const benefits = [];
-  const seenQuotes = new Set();
-  const isAnnex = docType === 'endorsement' || docType === 'schedule';
+  const sentences = text.split(/[.。\n]/);
   
-  const benefitPatterns = [
-    /(?:זכאי ל|זכאים ל)([^.。\n]+)/g,
-    /(?:מכסה|מכוסה)([^.。\n]+)/g,
-    /(?:שיפוי|פיצוי)([^.。\n]+)/g,
-    /(?:תגמול|תגמולים)([^.。\n]+)/g,
-    /(?:החזר|החזרים)([^.。\n]+)/g,
-    /(?:כיסוי ל|כיסוי עבור)([^.。\n]+)/g,
-    /(?:ישולם|ישולמו)([^.。\n]+)/g,
-    /(?:יקבל|יקבלו)([^.。\n]+)/g,
-  ];
+  // Track found benefits to avoid duplicates
+  const foundTitles = new Set();
   
-  for (const pattern of benefitPatterns) {
-    let match;
-    pattern.lastIndex = 0;
+  for (let i = 0; i < sentences.length; i++) {
+    const sentence = sentences[i]?.trim();
+    if (!sentence || sentence.length < 20) continue;
     
-    while ((match = pattern.exec(text)) !== null) {
-      const fullMatch = match[0];
-      const quote = fullMatch.substring(0, 300).trim();
-      const quoteKey = quote.substring(0, 80);
-      
-      if (seenQuotes.has(quoteKey) || quote.length < 20) continue;
-      seenQuotes.add(quoteKey);
-      
-      const layer = classifyBenefitLayer(quote);
-      const page = findPageForQuote(quote, pageTexts);
-      const pageText = pageTexts[page - 1] || text;
-      const quotePosition = pageText.indexOf(quote);
-      
-      let title = quote.substring(0, 80);
-      const lastSpace = title.lastIndexOf(' ');
-      if (lastSpace > 40) title = title.substring(0, lastSpace);
-      
-      benefits.push({
-        benefit_id: randomUUID(),
-        layer: layer,
-        title: title,
-        summary: quote,
-        status: 'included',
-        evidence_set: {
-          spans: [{
-            evidence_id: randomUUID(),
-            document_id,
-            page: page,
-            quote: quote,
-            verbatim: true,
-            confidence: 0.8,
-            // NEW ENRICHED FIELDS:
-            document_name: isAnnex ? `נספח: ${docDisplayName}` : 'פוליסה ראשית',
-            clause_number: extractClauseNumber(pageText, quotePosition),
-            heading_title: extractHeadingTitle(pageText, quotePosition),
-            excerpt_context: extractExcerptContext(pageText, quote),
-            highlighted_text: extractHighlightedText(pageText, quote),
-            is_annex: isAnnex,
-            annex_name: isAnnex ? docDisplayName : undefined,
-          }]
-        },
-        tags: generateTags(quote)
-      });
+    // Check if this sentence contains right-conferring language
+    const hasRightKeyword = [...RIGHT_KEYWORDS.hebrew, ...RIGHT_KEYWORDS.english]
+      .some(kw => sentence.includes(kw) || sentence.toLowerCase().includes(kw));
+    
+    if (!hasRightKeyword) continue;
+    
+    // Generate a title from the sentence
+    const title = sentence.substring(0, 80).trim();
+    if (foundTitles.has(title)) continue;
+    foundTitles.add(title);
+    
+    // Find which page this sentence is on
+    let page = 1;
+    let pageText = text;
+    if (pageTexts && Array.isArray(pageTexts)) {
+      for (let p = 0; p < pageTexts.length; p++) {
+        if (pageTexts[p] && pageTexts[p].includes(sentence.substring(0, 50))) {
+          page = p + 1;
+          pageText = pageTexts[p];
+          break;
+        }
+      }
     }
+    
+    // Create enriched evidence span
+    const evidenceSpan = enrichEvidenceSpan(
+      pageText,
+      sentence,
+      documentId,
+      displayName || 'Policy Document',
+      docType || 'policy',
+      page,
+      0.85
+    );
+    
+    const benefit = {
+      benefit_id: uuidv4(),
+      layer: detectBenefitLayer(sentence),
+      title: normalizeHebrewText(title),
+      summary: normalizeHebrewText(sentence),
+      status: 'identified',
+      evidence_set: {
+        spans: [evidenceSpan]
+      },
+      tags: [],
+      eligibility: {},
+      amounts: {},
+      actionable_steps: []
+    };
+    
+    benefits.push(benefit);
   }
   
-  console.log(`     📊 Layers: certain=${benefits.filter(b => b.layer === 'certain').length}, conditional=${benefits.filter(b => b.layer === 'conditional').length}, service=${benefits.filter(b => b.layer === 'service').length}`);
   return benefits;
 }
 
+// ============================================================
+// PIPELINE STAGES
+// ============================================================
 
-/**
- * Helper: Generate tags based on benefit content
- */
-function generateTags(text) {
-  const tags = [];
-  const lowerText = text.toLowerCase();
+async function updateRunStatus(run_id, status, stage) {
+  const { error } = await supabase
+    .from('runs')
+    .update({ status, stage, updated_at: new Date().toISOString() })
+    .eq('run_id', run_id);
   
-  const tagPatterns = {
-    'אשפוז': ['אשפוז', 'בית חולים', 'hospitalization'],
-    'ניתוח': ['ניתוח', 'surgery', 'operation'],
-    'תרופות': ['תרופות', 'medication', 'drugs', 'רוקחות'],
-    'שיניים': ['שיניים', 'dental', 'רפואת שיניים'],
-    'עיניים': ['עיניים', 'ראייה', 'משקפיים', 'vision', 'optical'],
-    'הריון ולידה': ['הריון', 'לידה', 'pregnancy', 'maternity'],
-    'בדיקות': ['בדיקות', 'אבחון', 'tests', 'diagnostic'],
-    'שיקום': ['שיקום', 'פיזיותרפיה', 'rehabilitation', 'physiotherapy'],
-    'נפשי': ['נפש', 'פסיכולוג', 'פסיכיאטר', 'mental', 'psychology'],
-    'סיעוד': ['סיעוד', 'סיעודי', 'nursing', 'long-term care'],
-  };
+  if (error) {
+    console.error(`     ⚠️ Failed to update run status: ${error.message}`);
+  }
+}
+
+async function stageIntake(run_id) {
+  console.log('  1️⃣  Intake - Fetching documents...');
+  await updateRunStatus(run_id, 'intake', 'Fetching and parsing documents');
   
-  for (const [tag, keywords] of Object.entries(tagPatterns)) {
-    if (keywords.some(kw => lowerText.includes(kw))) {
-      tags.push(tag);
+  // Fetch documents for this run
+  const { data: documents, error } = await supabase
+    .from('documents')
+    .select('*')
+    .eq('run_id', run_id);
+  
+  if (error) {
+    throw new Error(`Failed to fetch documents: ${error.message}`);
+  }
+  
+  if (!documents || documents.length === 0) {
+    throw new Error('No documents found for this run');
+  }
+  
+  const processedDocs = [];
+  
+  for (const doc of documents) {
+    console.log(`     📄 Processing: ${doc.display_name || doc.storage_key}`);
+    
+    try {
+      // Download PDF from storage
+      const { data: fileData, error: downloadError } = await supabase.storage
+        .from('policy-documents')
+        .download(doc.storage_key);
+      
+      if (downloadError) {
+        console.error(`     ⚠️ Failed to download ${doc.display_name}: ${downloadError.message}`);
+        continue;
+      }
+      
+      // Parse PDF
+      const buffer = Buffer.from(await fileData.arrayBuffer());
+      const pdfData = await pdf(buffer);
+      
+      // Extract text per page
+      const pageTexts = [];
+      const pages = pdfData.text.split(/\f/); // Form feed typically separates pages
+      for (const pageText of pages) {
+        pageTexts.push(normalizeHebrewText(pageText));
+      }
+      
+      processedDocs.push({
+        document_id: doc.document_id,
+        display_name: doc.display_name || 'Unknown Document',
+        doc_type: doc.doc_type || 'policy',
+        text: normalizeHebrewText(pdfData.text),
+        page_texts: pageTexts.length > 0 ? pageTexts : [normalizeHebrewText(pdfData.text)],
+        pages: pageTexts.length || 1
+      });
+      
+      // Update document with page count
+      await supabase
+        .from('documents')
+        .update({ pages: pageTexts.length || 1 })
+        .eq('document_id', doc.document_id);
+        
+    } catch (err) {
+      console.error(`     ⚠️ Error processing ${doc.display_name}: ${err.message}`);
     }
   }
   
-  return tags.length > 0 ? tags : null;
+  console.log(`     ✓ Extracted ${processedDocs.length} documents`);
+  return processedDocs;
 }
 
-/**
- * Helper: Calculate layer distribution for metrics
- */
-function calculateLayerDistribution(benefits) {
+async function stageMap(run_id, documents) {
+  console.log('  2️⃣  Map - Analyzing structure...');
+  await updateRunStatus(run_id, 'map', 'Analyzing document structure');
+  
+  if (!documents || !Array.isArray(documents)) {
+    console.log('     ⚠️ No documents to map');
+    return { sections: 0, documents: [] };
+  }
+  
+  let totalSections = 0;
+  
+  for (const doc of documents) {
+    if (!doc.text) continue;
+    
+    // Extract headings to understand structure
+    const headings = extractHeadings(doc.text);
+    totalSections += headings.length;
+    
+    // Extract clause references
+    const clauses = extractClauseReferences(doc.text);
+    doc.clauses = clauses;
+    doc.headings = headings;
+  }
+  
+  console.log(`     ✓ Mapped ${totalSections} sections`);
+  return { sections: totalSections, documents };
+}
+
+async function stageHarvest(run_id, documents, structure) {
+  console.log('  3️⃣  Harvest - Extracting rights...');
+  await updateRunStatus(run_id, 'harvest', 'Extracting insurance rights');
+  
+  const benefits = [];
+  
+  if (!documents || !Array.isArray(documents)) {
+    console.log('     ⚠️ No documents to harvest');
+    return benefits;
+  }
+  
+  for (const doc of documents) {
+    if (!doc.text) continue;
+    
+    // Pass display_name and doc_type for enrichment
+    const foundBenefits = extractBenefits(
+      doc.text,
+      doc.document_id,
+      doc.page_texts,
+      doc.display_name,
+      doc.doc_type
+    );
+    
+    if (foundBenefits && Array.isArray(foundBenefits)) {
+      benefits.push(...foundBenefits);
+    }
+  }
+  
+  // Count by layer
+  const certain = benefits.filter(b => b.layer === 'certain').length;
+  const conditional = benefits.filter(b => b.layer === 'conditional').length;
+  const service = benefits.filter(b => b.layer === 'service').length;
+  
+  console.log(`     📊 Layers: certain=${certain}, conditional=${conditional}, service=${service}`);
+  
+  return benefits;
+}
+
+async function stageNormalize(run_id, benefits) {
+  console.log('  4️⃣  Normalize - Standardizing data...');
+  await updateRunStatus(run_id, 'normalize', 'Normalizing extracted data');
+  
+  if (!benefits || !Array.isArray(benefits)) {
+    console.log('     ⚠️ No benefits to normalize');
+    return [];
+  }
+  
+  // Normalize each benefit
+  const normalizedBenefits = benefits.map(benefit => ({
+    ...benefit,
+    benefit_id: benefit.benefit_id || uuidv4(),
+    title: normalizeHebrewText(benefit.title || 'Untitled Benefit'),
+    summary: normalizeHebrewText(benefit.summary || ''),
+    layer: benefit.layer || 'conditional',
+    status: benefit.status || 'identified',
+    evidence_set: benefit.evidence_set || { spans: [] },
+    tags: benefit.tags || [],
+    eligibility: benefit.eligibility || {},
+    amounts: benefit.amounts || {},
+    actionable_steps: benefit.actionable_steps || []
+  }));
+  
+  console.log(`     ✓ Normalized ${normalizedBenefits.length} benefits`);
+  return normalizedBenefits;
+}
+
+async function stageValidate(run_id, benefits) {
+  console.log('  5️⃣  Validate - Checking quality...');
+  await updateRunStatus(run_id, 'validate', 'Validating extracted data');
+  
+  if (!benefits || !Array.isArray(benefits)) {
+    console.log('     ⚠️ No benefits to validate');
+    return { valid: [], invalid: [], score: 0 };
+  }
+  
+  // Filter benefits with valid evidence
+  const benefitsWithEvidence = benefits.filter(b => {
+    const spans = b.evidence_set?.spans;
+    return spans && Array.isArray(spans) && spans.length > 0;
+  });
+  
+  // Benefits without evidence
+  const benefitsWithoutEvidence = benefits.filter(b => {
+    const spans = b.evidence_set?.spans;
+    return !spans || !Array.isArray(spans) || spans.length === 0;
+  });
+  
+  const validationScore = benefits.length > 0 
+    ? (benefitsWithEvidence.length / benefits.length) * 100 
+    : 0;
+  
+  console.log(`     ✓ Valid: ${benefitsWithEvidence.length}, Invalid: ${benefitsWithoutEvidence.length}, Score: ${validationScore.toFixed(1)}%`);
+  
   return {
-    certain: benefits.filter(b => b.layer === 'certain').length,
-    conditional: benefits.filter(b => b.layer === 'conditional').length,
-    service: benefits.filter(b => b.layer === 'service').length
+    valid: benefitsWithEvidence,
+    invalid: benefitsWithoutEvidence,
+    score: validationScore
   };
 }
 
-/**
- * Helper: Normalize Hebrew text
- */
-function normalizeHebrewText(text) {
-  return text
-    .trim()
-    .replace(/\s+/g, ' ')
-    .replace(/״/g, '"');
+async function stageExport(run_id, validatedBenefits, documents) {
+  console.log('  6️⃣  Export - Saving to database...');
+  await updateRunStatus(run_id, 'export', 'Saving extracted data');
+  
+  const benefits = validatedBenefits?.valid || [];
+  
+  if (!benefits || benefits.length === 0) {
+    console.log('     ⚠️ No benefits to export');
+    return { benefitCount: 0 };
+  }
+  
+  // Insert benefits in batches of 50
+  const batchSize = 50;
+  let insertedCount = 0;
+  
+  for (let i = 0; i < benefits.length; i += batchSize) {
+    const batch = benefits.slice(i, i + batchSize).map(b => ({
+      benefit_id: b.benefit_id,
+      run_id: run_id,
+      layer: b.layer,
+      title: b.title,
+      summary: b.summary,
+      status: b.status,
+      evidence_set: b.evidence_set,
+      tags: b.tags,
+      eligibility: b.eligibility,
+      amounts: b.amounts,
+      actionable_steps: b.actionable_steps
+    }));
+    
+    const { error } = await supabase
+      .from('benefits')
+      .insert(batch);
+    
+    if (error) {
+      console.error(`     ⚠️ Batch insert error: ${error.message}`);
+    } else {
+      insertedCount += batch.length;
+    }
+  }
+  
+  // Calculate quality metrics
+  const totalPages = (documents || []).reduce((sum, d) => sum + (d.pages || 1), 0);
+  const qualityMetrics = {
+    total_pages_processed: totalPages,
+    extraction_confidence: validatedBenefits?.score || 0,
+    validation_score: validatedBenefits?.score || 0
+  };
+  
+  // Update run with quality metrics
+  await supabase
+    .from('runs')
+    .update({ quality_metrics: qualityMetrics })
+    .eq('run_id', run_id);
+  
+  console.log(`     ✓ Exported ${insertedCount} benefits`);
+  return { benefitCount: insertedCount };
 }
 
-/**
- * Helper: Sleep utility
- */
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+// ============================================================
+// MAIN PIPELINE
+// ============================================================
+
+async function processPolicyPipeline(run_id) {
+  console.log(`\n📋 Starting pipeline for run: ${run_id}`);
+  console.log('━'.repeat(50));
+  
+  try {
+    // Stage 1: Intake
+    const documents = await stageIntake(run_id);
+    if (!documents || documents.length === 0) {
+      throw new Error('No documents could be processed');
+    }
+    
+    // Stage 2: Map
+    const structure = await stageMap(run_id, documents);
+    
+    // Stage 3: Harvest
+    const benefits = await stageHarvest(run_id, documents, structure);
+    
+    // Stage 4: Normalize
+    const normalizedBenefits = await stageNormalize(run_id, benefits);
+    
+    // Stage 5: Validate
+    const validatedBenefits = await stageValidate(run_id, normalizedBenefits);
+    
+    // Stage 6: Export
+    const exportResult = await stageExport(run_id, validatedBenefits, documents);
+    
+    // Mark run as completed
+    await updateRunStatus(run_id, 'completed', 'Processing complete');
+    
+    console.log('━'.repeat(50));
+    console.log(`✅ Pipeline completed: ${exportResult.benefitCount} benefits extracted`);
+    
+    return { success: true, benefitCount: exportResult.benefitCount };
+    
+  } catch (error) {
+    console.error(`\n❌ Pipeline failed: ${error.message}`);
+    
+    // Mark run as failed
+    await supabase
+      .from('runs')
+      .update({ 
+        status: 'failed', 
+        stage: error.message,
+        updated_at: new Date().toISOString()
+      })
+      .eq('run_id', run_id);
+    
+    throw error;
+  }
+}
+
+// ============================================================
+// JOB PROCESSING
+// ============================================================
+
+async function processJob(job) {
+  const { run_id, attempt = 1 } = job;
+  
+  console.log(`\n🔄 Processing job: ${run_id} (attempt ${attempt}/${MAX_RETRIES})`);
+  
+  try {
+    // Verify run exists
+    const { data: run, error: runError } = await supabase
+      .from('runs')
+      .select('*')
+      .eq('run_id', run_id)
+      .maybeSingle();
+    
+    if (runError) {
+      throw new Error(`Failed to fetch run: ${runError.message}`);
+    }
+    
+    if (!run) {
+      console.log(`⚠️ Run ${run_id} not found, skipping`);
+      return;
+    }
+    
+    if (run.status === 'completed' || run.status === 'failed') {
+      console.log(`⚠️ Run ${run_id} already ${run.status}, skipping`);
+      return;
+    }
+    
+    // Process the pipeline
+    await processPolicyPipeline(run_id);
+    
+  } catch (error) {
+    console.error(`❌ Job failed: ${run_id} ${error.message}`);
+    
+    if (attempt < MAX_RETRIES) {
+      // Re-queue with incremented attempt
+      console.log(`↩️ Re-queuing job (attempt ${attempt + 1})`);
+      await redis.lpush(QUEUE_NAME, JSON.stringify({
+        run_id,
+        attempt: attempt + 1,
+        queued_at: new Date().toISOString()
+      }));
+    } else {
+      console.error(`💀 Job exhausted retries: ${run_id}`);
+    }
+    
+    throw error;
+  }
+}
+
+// ============================================================
+// WORKER LOOP
+// ============================================================
+
+async function startWorker() {
+  console.log('🚀 Insurance Worker Started');
+  console.log(`   Queue: ${QUEUE_NAME}`);
+  console.log(`   Poll Interval: ${POLL_INTERVAL}ms`);
+  console.log(`   Max Retries: ${MAX_RETRIES}`);
+  console.log('━'.repeat(50));
+  
+  while (true) {
+    try {
+      // Pop job from queue
+      const jobData = await redis.rpop(QUEUE_NAME);
+      
+      if (jobData) {
+        const job = typeof jobData === 'string' ? JSON.parse(jobData) : jobData;
+        await processJob(job);
+      } else {
+        // No jobs, wait before polling again
+        await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+      }
+      
+    } catch (error) {
+      console.error(`Worker error: ${error.message}`);
+      // Wait before retrying
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+    }
+  }
 }
 
 // Start the worker
-startWorker().catch(error => {
-  console.error('💥 Worker crashed:', error);
-  process.exit(1);
-});
+startWorker().catch(console.error);
