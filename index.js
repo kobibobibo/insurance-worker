@@ -24,6 +24,75 @@ const QUEUE_NAME = 'policy-processing';
 const POLL_INTERVAL = 2000;
 const MAX_RETRIES = 3;
 
+// ═══════════════════════════════════════════════════════
+// CLAUSE EXTRACTION UTILITIES (add after MAX_RETRIES)
+// ═══════════════════════════════════════════════════════
+
+const CLAUSE_PATTERNS = [
+  /סעיף\s*([\d\.]+(?:\s*[א-ת])?)/gi,
+  /פרק\s*([\d\.]+(?:\s*[א-ת])?)/gi,
+  /section\s*([\d\.]+[a-z]?)/gi,
+  /clause\s*([\d\.]+[a-z]?)/gi,
+];
+
+const RIGHT_KEYWORDS = ['זכאי', 'זכאית', 'מכוסה', 'ישולם', 'יכוסה', 'entitled', 'covered', 'payable'];
+
+function extractClauseNumber(text, quotePosition) {
+  let nearest = null;
+  for (const pattern of CLAUSE_PATTERNS) {
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      const distance = Math.abs(match.index - quotePosition);
+      if (!nearest || distance < nearest.distance) {
+        nearest = { number: match[1].trim(), distance };
+      }
+    }
+  }
+  return nearest?.number;
+}
+
+function extractHeadingTitle(text, quotePosition) {
+  const textBefore = text.substring(0, quotePosition);
+  const lines = textBefore.split('\n').reverse();
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.endsWith(':') && trimmed.length > 5 && trimmed.length < 80) {
+      return trimmed.slice(0, -1);
+    }
+    if (/^[א-ת\d\.]+\.\s+/.test(trimmed) && trimmed.length < 60) {
+      return trimmed;
+    }
+  }
+  return undefined;
+}
+
+function extractHighlightedText(text, quote) {
+  const quoteStart = text.indexOf(quote);
+  if (quoteStart === -1) return undefined;
+  const contextStart = Math.max(0, quoteStart - 200);
+  const contextEnd = Math.min(text.length, quoteStart + quote.length + 200);
+  const sentences = text.substring(contextStart, contextEnd).split(/[.。]\s+/);
+  for (const sentence of sentences) {
+    if (RIGHT_KEYWORDS.some(kw => sentence.includes(kw)) && sentence.length > 20) {
+      return sentence.trim() + '.';
+    }
+  }
+  return undefined;
+}
+
+function extractExcerptContext(text, quote) {
+  const quoteStart = text.indexOf(quote);
+  if (quoteStart === -1) return quote;
+  const start = Math.max(0, quoteStart - 100);
+  const end = Math.min(text.length, quoteStart + quote.length + 100);
+  let excerpt = text.substring(start, end);
+  if (start > 0) excerpt = '...' + excerpt;
+  if (end < text.length) excerpt += '...';
+  return excerpt;
+}
+
+
 /**
  * Main worker loop - polls Redis queue for jobs
  */
@@ -235,23 +304,20 @@ async function stageHarvest(run_id, documents, structure) {
   const benefits = [];
 
   for (const doc of documents) {
-    const foundBenefits = extractBenefits(doc.text, doc.document_id, doc.page_texts);
+    // Pass display_name and doc_type for enrichment
+    const foundBenefits = extractBenefits(
+      doc.text, 
+      doc.document_id, 
+      doc.page_texts,
+      doc.display_name,  // NEW
+      doc.doc_type       // NEW
+    );
     benefits.push(...foundBenefits);
   }
 
-  if (benefits.length > 0) {
-    const { error } = await supabase
-      .from('benefits')
-      .insert(benefits.map(b => ({
-        run_id,
-        ...b
-      })));
-
-    if (error) throw error;
-  }
-
-  return benefits;
+  // ... rest unchanged
 }
+
 
 /**
  * Stage 4: Normalize - Standardize data
@@ -482,14 +548,13 @@ function findPageForQuote(quote, pageTexts) {
   return 1; // Default to page 1 if not found
 }
 
-/**
- * Helper: Extract benefits from text with layer classification
- */
-function extractBenefits(text, document_id, pageTexts = []) {
+
+
+function extractBenefits(text, document_id, pageTexts = [], docDisplayName = '', docType = 'policy') {
   const benefits = [];
-  const seenQuotes = new Set(); // Avoid duplicates
+  const seenQuotes = new Set();
+  const isAnnex = docType === 'endorsement' || docType === 'schedule';
   
-  // Multiple patterns for Hebrew insurance benefit language
   const benefitPatterns = [
     /(?:זכאי ל|זכאים ל)([^.。\n]+)/g,
     /(?:מכסה|מכוסה)([^.。\n]+)/g,
@@ -503,32 +568,24 @@ function extractBenefits(text, document_id, pageTexts = []) {
   
   for (const pattern of benefitPatterns) {
     let match;
-    // Reset regex lastIndex for each pattern
     pattern.lastIndex = 0;
     
     while ((match = pattern.exec(text)) !== null) {
       const fullMatch = match[0];
-      const quote = fullMatch.substring(0, 300).trim(); // Longer quote for better context
-      
-      // Skip duplicates and very short matches
+      const quote = fullMatch.substring(0, 300).trim();
       const quoteKey = quote.substring(0, 80);
-      if (seenQuotes.has(quoteKey) || quote.length < 20) {
-        continue;
-      }
+      
+      if (seenQuotes.has(quoteKey) || quote.length < 20) continue;
       seenQuotes.add(quoteKey);
       
-      // Classify the layer based on the quote content
       const layer = classifyBenefitLayer(quote);
-      
-      // Find the page where this quote appears
       const page = findPageForQuote(quote, pageTexts);
+      const pageText = pageTexts[page - 1] || text;
+      const quotePosition = pageText.indexOf(quote);
       
-      // Generate a cleaner title (first 80 chars, break at word boundary)
       let title = quote.substring(0, 80);
       const lastSpace = title.lastIndexOf(' ');
-      if (lastSpace > 40) {
-        title = title.substring(0, lastSpace);
-      }
+      if (lastSpace > 40) title = title.substring(0, lastSpace);
       
       benefits.push({
         benefit_id: randomUUID(),
@@ -538,11 +595,20 @@ function extractBenefits(text, document_id, pageTexts = []) {
         status: 'included',
         evidence_set: {
           spans: [{
+            evidence_id: randomUUID(),
             document_id,
             page: page,
             quote: quote,
             verbatim: true,
-            confidence: 0.8
+            confidence: 0.8,
+            // NEW ENRICHED FIELDS:
+            document_name: isAnnex ? `נספח: ${docDisplayName}` : 'פוליסה ראשית',
+            clause_number: extractClauseNumber(pageText, quotePosition),
+            heading_title: extractHeadingTitle(pageText, quotePosition),
+            excerpt_context: extractExcerptContext(pageText, quote),
+            highlighted_text: extractHighlightedText(pageText, quote),
+            is_annex: isAnnex,
+            annex_name: isAnnex ? docDisplayName : undefined,
           }]
         },
         tags: generateTags(quote)
@@ -550,10 +616,10 @@ function extractBenefits(text, document_id, pageTexts = []) {
     }
   }
   
-  console.log(` Layer distribution: certain=${benefits.filter(b => b.layer === 'certain').length}, conditional=${benefits.filter(b => b.layer === 'conditional').length}, service=${benefits.filter(b => b.layer === 'service').length}`);
-  
+  console.log(`     📊 Layers: certain=${benefits.filter(b => b.layer === 'certain').length}, conditional=${benefits.filter(b => b.layer === 'conditional').length}, service=${benefits.filter(b => b.layer === 'service').length}`);
   return benefits;
 }
+
 
 /**
  * Helper: Generate tags based on benefit content
