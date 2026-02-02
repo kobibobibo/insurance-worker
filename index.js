@@ -494,12 +494,12 @@ function extractBenefits(text, documentId, pageTexts, displayName, docType) {
       0.85
     );
     
+    // NOTE: status field is NOT included here - the database default will be used
     const benefit = {
       benefit_id: uuidv4(),
       layer: detectBenefitLayer(sentence),
       title: normalizeHebrewText(title),
       summary: normalizeHebrewText(sentence),
-      status: 'active',
       evidence_set: {
         spans: [evidenceSpan]
       },
@@ -532,7 +532,7 @@ async function updateRunStatus(run_id, status, stage) {
 
 async function stageIntake(run_id) {
   console.log('  1️⃣  Intake - Fetching documents...');
-  await updateRunStatus(run_id, 'intake', 'intake');
+  await updateRunStatus(run_id, 'queued', 'intake');
   
   // Fetch documents for this run
   const { data: documents, error } = await supabase
@@ -601,7 +601,7 @@ async function stageIntake(run_id) {
 
 async function stageMap(run_id, documents) {
   console.log('  2️⃣  Map - Analyzing structure...');
-  await updateRunStatus(run_id, 'map', 'map');
+  await updateRunStatus(run_id, 'queued', 'map');
   
   if (!documents || !Array.isArray(documents)) {
     console.log('     ⚠️ No documents to map');
@@ -629,7 +629,7 @@ async function stageMap(run_id, documents) {
 
 async function stageHarvest(run_id, documents, structure) {
   console.log('  3️⃣  Harvest - Extracting rights...');
-  await updateRunStatus(run_id, 'harvest', 'harvest');
+  await updateRunStatus(run_id, 'queued', 'harvest');
   
   const benefits = [];
   
@@ -667,21 +667,21 @@ async function stageHarvest(run_id, documents, structure) {
 
 async function stageNormalize(run_id, benefits) {
   console.log('  4️⃣  Normalize - Standardizing data...');
-  await updateRunStatus(run_id, 'normalize', 'normalize');
+  await updateRunStatus(run_id, 'queued', 'normalize');
   
   if (!benefits || !Array.isArray(benefits)) {
     console.log('     ⚠️ No benefits to normalize');
     return [];
   }
   
-  // Normalize each benefit
+  // Normalize each benefit - NOTE: status is NOT set, database default will be used
   const normalizedBenefits = benefits.map(benefit => ({
     ...benefit,
     benefit_id: benefit.benefit_id || uuidv4(),
     title: normalizeHebrewText(benefit.title || 'Untitled Benefit'),
     summary: normalizeHebrewText(benefit.summary || ''),
     layer: benefit.layer || 'conditional',
-    status: benefit.status || 'active',
+    // status field intentionally omitted - database has default
     evidence_set: benefit.evidence_set || { spans: [] },
     tags: benefit.tags || [],
     eligibility: benefit.eligibility || {},
@@ -695,7 +695,7 @@ async function stageNormalize(run_id, benefits) {
 
 async function stageValidate(run_id, benefits) {
   console.log('  5️⃣  Validate - Checking quality...');
-  await updateRunStatus(run_id, 'validate', 'validate');
+  await updateRunStatus(run_id, 'queued', 'validate');
   
   if (!benefits || !Array.isArray(benefits)) {
     console.log('     ⚠️ No benefits to validate');
@@ -729,7 +729,7 @@ async function stageValidate(run_id, benefits) {
 
 async function stageExport(run_id, validatedBenefits, documents) {
   console.log('  6️⃣  Export - Saving to database...');
-  await updateRunStatus(run_id, 'export', 'export');
+  await updateRunStatus(run_id, 'queued', 'export');
   
   const benefits = validatedBenefits?.valid || [];
   
@@ -739,6 +739,7 @@ async function stageExport(run_id, validatedBenefits, documents) {
   }
   
   // Insert benefits in batches of 50
+  // NOTE: status field is NOT included - database default will be used
   const batchSize = 50;
   let insertedCount = 0;
   
@@ -749,7 +750,7 @@ async function stageExport(run_id, validatedBenefits, documents) {
       layer: b.layer,
       title: b.title,
       summary: b.summary,
-      status: b.status,
+      // status field intentionally omitted - database has default value
       evidence_set: b.evidence_set,
       tags: b.tags,
       eligibility: b.eligibility,
