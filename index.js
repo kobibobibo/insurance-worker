@@ -499,7 +499,7 @@ function extractBenefits(text, documentId, pageTexts, displayName, docType) {
       layer: detectBenefitLayer(sentence),
       title: normalizeHebrewText(title),
       summary: normalizeHebrewText(sentence),
-      status: 'identified',
+      status: 'active',
       evidence_set: {
         spans: [evidenceSpan]
       },
@@ -532,7 +532,7 @@ async function updateRunStatus(run_id, status, stage) {
 
 async function stageIntake(run_id) {
   console.log('  1️⃣  Intake - Fetching documents...');
-  await updateRunStatus(run_id, 'intake', 'Fetching and parsing documents');
+  await updateRunStatus(run_id, 'intake', 'intake');
   
   // Fetch documents for this run
   const { data: documents, error } = await supabase
@@ -601,7 +601,7 @@ async function stageIntake(run_id) {
 
 async function stageMap(run_id, documents) {
   console.log('  2️⃣  Map - Analyzing structure...');
-  await updateRunStatus(run_id, 'map', 'Analyzing document structure');
+  await updateRunStatus(run_id, 'map', 'map');
   
   if (!documents || !Array.isArray(documents)) {
     console.log('     ⚠️ No documents to map');
@@ -629,7 +629,7 @@ async function stageMap(run_id, documents) {
 
 async function stageHarvest(run_id, documents, structure) {
   console.log('  3️⃣  Harvest - Extracting rights...');
-  await updateRunStatus(run_id, 'harvest', 'Extracting insurance rights');
+  await updateRunStatus(run_id, 'harvest', 'harvest');
   
   const benefits = [];
   
@@ -667,7 +667,7 @@ async function stageHarvest(run_id, documents, structure) {
 
 async function stageNormalize(run_id, benefits) {
   console.log('  4️⃣  Normalize - Standardizing data...');
-  await updateRunStatus(run_id, 'normalize', 'Normalizing extracted data');
+  await updateRunStatus(run_id, 'normalize', 'normalize');
   
   if (!benefits || !Array.isArray(benefits)) {
     console.log('     ⚠️ No benefits to normalize');
@@ -681,7 +681,7 @@ async function stageNormalize(run_id, benefits) {
     title: normalizeHebrewText(benefit.title || 'Untitled Benefit'),
     summary: normalizeHebrewText(benefit.summary || ''),
     layer: benefit.layer || 'conditional',
-    status: benefit.status || 'identified',
+    status: benefit.status || 'active',
     evidence_set: benefit.evidence_set || { spans: [] },
     tags: benefit.tags || [],
     eligibility: benefit.eligibility || {},
@@ -695,7 +695,7 @@ async function stageNormalize(run_id, benefits) {
 
 async function stageValidate(run_id, benefits) {
   console.log('  5️⃣  Validate - Checking quality...');
-  await updateRunStatus(run_id, 'validate', 'Validating extracted data');
+  await updateRunStatus(run_id, 'validate', 'validate');
   
   if (!benefits || !Array.isArray(benefits)) {
     console.log('     ⚠️ No benefits to validate');
@@ -729,7 +729,7 @@ async function stageValidate(run_id, benefits) {
 
 async function stageExport(run_id, validatedBenefits, documents) {
   console.log('  6️⃣  Export - Saving to database...');
-  await updateRunStatus(run_id, 'export', 'Saving extracted data');
+  await updateRunStatus(run_id, 'export', 'export');
   
   const benefits = validatedBenefits?.valid || [];
   
@@ -817,7 +817,7 @@ async function processPolicyPipeline(run_id) {
     const exportResult = await stageExport(run_id, validatedBenefits, documents);
     
     // Mark run as completed
-    await updateRunStatus(run_id, 'completed', 'Processing complete');
+    await updateRunStatus(run_id, 'completed', 'export');
     
     console.log('━'.repeat(50));
     console.log(`✅ Pipeline completed: ${exportResult.benefitCount} benefits extracted`);
@@ -832,7 +832,8 @@ async function processPolicyPipeline(run_id) {
       .from('runs')
       .update({ 
         status: 'failed', 
-        stage: error.message,
+        stage: 'intake',
+        error_message: error.message,
         updated_at: new Date().toISOString()
       })
       .eq('run_id', run_id);
