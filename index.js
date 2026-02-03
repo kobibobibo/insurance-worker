@@ -752,7 +752,7 @@ async function stageExport(run_id, validatedBenefits, documents) {
       layer: b.layer,
       title: b.title,
       summary: b.summary,
-      status: 'active', // REQUIRED: Must be 'active' or 'inactive' per benefits_status_check constraint
+      status: 'included', // REQUIRED: Must be 'included' or 'excluded' per benefits_status_check constraint
       evidence_set: b.evidence_set,
       tags: b.tags,
       eligibility: b.eligibility,
@@ -778,7 +778,7 @@ async function stageExport(run_id, validatedBenefits, documents) {
         run_id: batch[0].run_id,
         layer: batch[0].layer,
         title: batch[0].title?.substring(0, 50) || 'Test',
-        status: 'active',
+        status: 'included',
         evidence_set: { spans: [] }
       };
       console.error(`     📋 Trying minimal insert: ${JSON.stringify(minimalBenefit)}`);
