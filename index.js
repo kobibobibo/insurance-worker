@@ -392,8 +392,11 @@ function enrichEvidenceSpan(pageText, quote, documentId, documentName, documentT
 function normalizeHebrewText(text) {
   if (!text) return '';
   return text
-    .replace(/\x00/g, '')
+    // Remove ALL control characters (0x00-0x1F) except tab (0x09), newline (0x0A), carriage return (0x0D)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+    // Remove Unicode directional markers and BOM
     .replace(/[\u200E\u200F\u202A-\u202E\uFEFF]/g, '')
+    // Normalize line endings
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .trim();
