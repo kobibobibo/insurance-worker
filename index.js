@@ -771,8 +771,23 @@ async function stageExport(run_id, validatedBenefits, documents) {
     
     if (error) {
       console.error(`     ⚠️ Batch insert error: ${error.message}`);
-      // Debug: log the actual data being sent
-      console.error(`     📋 Sample benefit: ${JSON.stringify(batch[0], null, 2).substring(0, 500)}`);
+      console.error(`     🔍 Error code: ${error.code}, hint: ${error.hint}, details: ${error.details}`);
+      // Try inserting a minimal benefit to isolate the issue
+      const minimalBenefit = {
+        benefit_id: batch[0].benefit_id,
+        run_id: batch[0].run_id,
+        layer: batch[0].layer,
+        title: batch[0].title?.substring(0, 50) || 'Test',
+        status: 'active',
+        evidence_set: { spans: [] }
+      };
+      console.error(`     📋 Trying minimal insert: ${JSON.stringify(minimalBenefit)}`);
+      const { error: minError } = await supabase.from('benefits').insert([minimalBenefit]);
+      if (minError) {
+        console.error(`     ❌ Minimal insert also failed: ${minError.message} (code: ${minError.code})`);
+      } else {
+        console.error(`     ✅ Minimal insert succeeded - issue is with extra fields`);
+      }
     } else {
       insertedCount += batch.length;
     }
