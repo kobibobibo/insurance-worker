@@ -739,7 +739,6 @@ async function stageExport(run_id, validatedBenefits, documents) {
   }
   
   // Insert benefits in batches of 50
-  // NOTE: status field is NOT included - database default will be used
   const batchSize = 50;
   let insertedCount = 0;
   
@@ -750,7 +749,7 @@ async function stageExport(run_id, validatedBenefits, documents) {
       layer: b.layer,
       title: b.title,
       summary: b.summary,
-      status: 'active', // Must be 'active' or 'inactive' per benefits_status_check constraint
+      status: 'active', // REQUIRED: Must be 'active' or 'inactive' per benefits_status_check constraint
       evidence_set: b.evidence_set,
       tags: b.tags,
       eligibility: b.eligibility,
@@ -758,12 +757,19 @@ async function stageExport(run_id, validatedBenefits, documents) {
       actionable_steps: b.actionable_steps
     }));
     
+    // Debug: log first benefit in batch to verify status is set
+    if (i === 0) {
+      console.log(`     📋 First benefit status: "${batch[0]?.status}"`);
+    }
+    
     const { error } = await supabase
       .from('benefits')
       .insert(batch);
     
     if (error) {
       console.error(`     ⚠️ Batch insert error: ${error.message}`);
+      // Debug: log the actual data being sent
+      console.error(`     📋 Sample benefit: ${JSON.stringify(batch[0], null, 2).substring(0, 500)}`);
     } else {
       insertedCount += batch.length;
     }
