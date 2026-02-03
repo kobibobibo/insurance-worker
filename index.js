@@ -750,7 +750,7 @@ async function stageExport(run_id, validatedBenefits, documents) {
       layer: b.layer,
       title: b.title,
       summary: b.summary,
-      // status field intentionally omitted - database has default value
+      status: 'active', // Must be 'active' or 'inactive' per benefits_status_check constraint
       evidence_set: b.evidence_set,
       tags: b.tags,
       eligibility: b.eligibility,
