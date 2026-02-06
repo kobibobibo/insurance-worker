@@ -779,9 +779,17 @@ function extractBenefits(text, documentId, pageTexts, displayName, docType, hasS
       0.85
     );
     
-    // NOTE: status field is NOT included here - the database default will be used
+    // Detect if this is an included benefit or an exclusion
+    const benefitId = uuidv4();
+    const benefitStatus = detectBenefitStatus(sentence);
+    
+    // Extract amounts with schedule awareness
+    const amounts = hasAmountReference(sentence) 
+      ? extractAmounts(sentence, hasSchedule) 
+      : {};
+    
     const benefit = {
-      benefit_id: uuidv4(),
+      benefit_id: benefitId,
       layer: detectBenefitLayer(sentence),
       title: normalizeHebrewText(title),
       summary: normalizeHebrewText(sentence),
@@ -1064,20 +1072,30 @@ async function stageNormalize(run_id, harvestResult) {
     return { ...harvestResult, normalizedBenefits: [] };
   }
   
-  // Normalize each benefit - NOTE: status is NOT set, database default will be used
-  const normalizedBenefits = benefits.map(benefit => ({
-    ...benefit,
-    benefit_id: benefit.benefit_id || uuidv4(),
-    title: normalizeHebrewText(benefit.title || 'Untitled Benefit'),
-    summary: normalizeHebrewText(benefit.summary || ''),
-    layer: benefit.layer || 'conditional',
-    // status field intentionally omitted - database has default
-    evidence_set: benefit.evidence_set || { spans: [] },
-    tags: benefit.tags || [],
-    eligibility: benefit.eligibility || {},
-    amounts: benefit.amounts || {},
-    actionable_steps: benefit.actionable_steps || []
-  }));
+  // Normalize each benefit - preserve status from extraction
+  const normalizedBenefits = benefits.map((benefit) => {
+    // Ensure amounts have proper value_state based on schedule presence
+    let amounts = benefit.amounts || {};
+    if (hasAmountReference(benefit.summary) && !hasSchedule) {
+      amounts = {
+        value_state: 'unknown_schedule_required',
+        values: []
+      };
+    }
+    
+    return {
+      benefit_id: benefit.benefit_id || uuidv4(),
+      title: normalizeHebrewText(benefit.title || 'Untitled Benefit'),
+      summary: normalizeHebrewText(benefit.summary || ''),
+      layer: benefit.layer || 'conditional',
+      status: benefit.status || 'included',
+      evidence_set: benefit.evidence_set || { spans: [] },
+      tags: benefit.tags || [],
+      eligibility: benefit.eligibility || {},
+      amounts: amounts,
+      actionable_steps: benefit.actionable_steps || []
+    };
+  });
   
   console.log(`     ✓ Normalized ${normalizedBenefits.length} benefits`);
   return { ...harvestResult, normalizedBenefits };
@@ -1165,24 +1183,23 @@ async function stageExport(run_id, validateResult) {
   let insertedCount = 0;
   
   for (let i = 0; i < benefits.length; i += batchSize) {
-    const batch = benefits.slice(i, i + batchSize).map(b => ({
-      benefit_id: b.benefit_id,
-      run_id: run_id,
-      layer: b.layer,
-      title: b.title,
-      summary: b.summary,
-      status: 'included', // REQUIRED: Must be 'included' or 'excluded' per benefits_status_check constraint
-      evidence_set: b.evidence_set,
-      tags: b.tags,
-      eligibility: b.eligibility,
-      amounts: b.amounts,
-      actionable_steps: b.actionable_steps
-    }));
-    
-    // Debug: log first benefit in batch to verify status is set
-    if (i === 0) {
-      console.log(`     📋 First benefit status: "${batch[0]?.status}"`);
-    }
+    const batch = benefits.slice(i, i + batchSize).map((b) => {
+      // Validate status is one of allowed values
+      const status = b.status === 'excluded' ? 'excluded' : 'included';
+      return {
+        benefit_id: b.benefit_id,
+        run_id: run_id,
+        layer: b.layer,
+        title: b.title,
+        summary: b.summary,
+        status: status, // 'included' or 'excluded' per benefits_status_check constraint
+        evidence_set: b.evidence_set,
+        tags: b.tags,
+        eligibility: b.eligibility,
+        amounts: b.amounts,
+        actionable_steps: b.actionable_steps
+      };
+    });
     
     const { error } = await supabase
       .from('benefits')
