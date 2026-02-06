@@ -210,6 +210,45 @@ const METADATA_PATTERNS = {
   ],
 };
 
+// ============================================================
+// CLAIM HISTORY EXTRACTION PATTERNS
+// ============================================================
+
+const CLAIM_PATTERNS = {
+  // Claim number patterns
+  claimNumber: [
+    /(?:מספר\s+תביעה|תביעה\s+מס['"]?)[:\s]*([A-Z0-9\-\/]+)/i,
+    /(?:claim\s*(?:no\.?|number|#|ref))[:\s]*([A-Z0-9\-\/]+)/i,
+    /(?:אסמכתא|מס['\.]\s*אסמכתא)[:\s]*([A-Z0-9\-\/]+)/i,
+    /(?:reference\s*(?:no\.?|number)?)[:\s]*([A-Z0-9\-\/]+)/i,
+  ],
+  // Claim submission date patterns
+  claimDate: [
+    /(?:תאריך\s+(?:הגשת?\s+)?(?:תביעה|הפנייה)|הוגש\s+ביום)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/,
+    /(?:date\s+(?:of\s+)?(?:claim|submission))[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/i,
+    /(?:submitted\s+on|filed\s+on)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/i,
+  ],
+  // Denial date patterns
+  denialDate: [
+    /(?:תאריך\s+(?:הדחייה|דחייה)|נדחה\s+ביום|מכתב\s+דחייה\s+מיום)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/,
+    /(?:date\s+of\s+(?:denial|rejection))[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/i,
+    /(?:denied\s+on|rejected\s+on)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/i,
+  ],
+  // Denial reason patterns - captures the text after the pattern
+  denialReason: [
+    /(?:סיבת\s+הדחייה|נימוק\s+הדחייה|נדחתה\s+(?:בשל|עקב|מהסיבה))[:\s]*([^\n]{10,200})/,
+    /(?:reason\s+for\s+(?:denial|rejection))[:\s]*([^\n]{10,200})/i,
+    /(?:your\s+claim\s+(?:was|has\s+been)\s+(?:denied|rejected)\s+(?:because|due\s+to))[:\s]*([^\n]{10,200})/i,
+    /(?:לצערנו,?\s+(?:לא\s+נוכל\s+לאשר|איננו\s+יכולים\s+לאשר|התביעה\s+נדחית))[,\s]*(?:מאחר|היות|כיוון)\s+([^\n]{10,200})/,
+  ],
+  // Event date from claim forms
+  eventDate: [
+    /(?:תאריך\s+(?:האירוע|הניתוח|האשפוז|התאונה))[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/,
+    /(?:date\s+of\s+(?:event|incident|surgery|hospitalization|accident))[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/i,
+    /(?:occurred\s+on|happened\s+on)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/i,
+  ],
+};
+
 /**
  * Extract policy metadata from document text
  */
@@ -221,11 +260,29 @@ function extractPolicyMetadata(documents) {
     policyStartDate: "",
     policyEndDate: "",
     insuredName: "",
+    // Claim history fields
+    claimNumber: "",
+    claimDate: "",
+    denialDate: "",
+    denialReason: "",
+    eventDate: "",
     extractedAt: new Date().toISOString(),
   };
   
-  // Combine text from all documents (focus on first few pages)
-  const combinedText = documents
+  // Separate documents by type for targeted extraction
+  const policyDocs = documents.filter(d => 
+    ['policy', 'general_terms', 'schedule', 'endorsement'].includes(d.doc_type)
+  );
+  const claimDocs = documents.filter(d => 
+    ['claim_form', 'correspondence', 'unknown'].includes(d.doc_type) || 
+    d.display_name?.toLowerCase().includes('claim') ||
+    d.display_name?.toLowerCase().includes('תביעה') ||
+    d.display_name?.toLowerCase().includes('דחייה') ||
+    d.display_name?.toLowerCase().includes('denial')
+  );
+  
+  // Combine text from policy documents (focus on first few pages)
+  const policyText = policyDocs
     .map(doc => {
       if (doc.page_texts && doc.page_texts.length > 0) {
         return doc.page_texts.slice(0, 5).join('\n');
@@ -234,56 +291,133 @@ function extractPolicyMetadata(documents) {
     })
     .join('\n');
   
-  if (!combinedText) return metadata;
+  // Combine text from claim-related documents
+  const claimText = claimDocs
+    .map(doc => doc.text || '')
+    .join('\n');
   
-  // Extract insurer name
-  for (const pattern of METADATA_PATTERNS.insurerName) {
-    const match = combinedText.match(pattern);
-    if (match) {
-      metadata.insurerName = match[1].trim();
-      break;
+  // Also search all documents if specific types not found
+  const allText = documents
+    .map(doc => {
+      if (doc.page_texts && doc.page_texts.length > 0) {
+        return doc.page_texts.slice(0, 5).join('\n');
+      }
+      return doc.text?.substring(0, 10000) || '';
+    })
+    .join('\n');
+  
+  const textToSearch = policyText || allText;
+  
+  if (!textToSearch && !claimText) return metadata;
+  
+  // Extract policy metadata from policy documents
+  if (textToSearch) {
+    // Extract insurer name
+    for (const pattern of METADATA_PATTERNS.insurerName) {
+      const match = textToSearch.match(pattern);
+      if (match) {
+        metadata.insurerName = match[1].trim();
+        break;
+      }
+    }
+    
+    // Extract policy number
+    for (const pattern of METADATA_PATTERNS.policyNumber) {
+      const match = textToSearch.match(pattern);
+      if (match) {
+        metadata.policyNumber = match[1].trim();
+        break;
+      }
+    }
+    
+    // Extract policy type
+    for (const pattern of METADATA_PATTERNS.policyType) {
+      const match = textToSearch.match(pattern);
+      if (match) {
+        metadata.policyType = match[1].trim();
+        break;
+      }
+    }
+    
+    // Extract dates
+    const dateMatches = [];
+    for (const pattern of METADATA_PATTERNS.policyDates) {
+      const match = textToSearch.match(pattern);
+      if (match) {
+        dateMatches.push(match[1]);
+      }
+    }
+    if (dateMatches.length > 0) {
+      metadata.policyStartDate = formatDateForForm(dateMatches[0]);
+      if (dateMatches.length > 1) {
+        metadata.policyEndDate = formatDateForForm(dateMatches[1]);
+      }
+    }
+    
+    // Extract insured name
+    for (const pattern of METADATA_PATTERNS.insuredName) {
+      const match = textToSearch.match(pattern);
+      if (match) {
+        metadata.insuredName = match[1].trim();
+        break;
+      }
     }
   }
   
-  // Extract policy number
-  for (const pattern of METADATA_PATTERNS.policyNumber) {
-    const match = combinedText.match(pattern);
-    if (match) {
-      metadata.policyNumber = match[1].trim();
-      break;
+  // Extract claim history from claim documents (or all docs as fallback)
+  const claimSearchText = claimText || allText;
+  if (claimSearchText) {
+    // Extract claim number
+    for (const pattern of CLAIM_PATTERNS.claimNumber) {
+      const match = claimSearchText.match(pattern);
+      if (match) {
+        metadata.claimNumber = match[1].trim();
+        console.log(`     📋 Found claim number: ${metadata.claimNumber}`);
+        break;
+      }
     }
-  }
-  
-  // Extract policy type
-  for (const pattern of METADATA_PATTERNS.policyType) {
-    const match = combinedText.match(pattern);
-    if (match) {
-      metadata.policyType = match[1].trim();
-      break;
+    
+    // Extract claim submission date
+    for (const pattern of CLAIM_PATTERNS.claimDate) {
+      const match = claimSearchText.match(pattern);
+      if (match) {
+        metadata.claimDate = formatDateForForm(match[1]);
+        console.log(`     📋 Found claim date: ${metadata.claimDate}`);
+        break;
+      }
     }
-  }
-  
-  // Extract dates
-  const dateMatches = [];
-  for (const pattern of METADATA_PATTERNS.policyDates) {
-    const match = combinedText.match(pattern);
-    if (match) {
-      dateMatches.push(match[1]);
+    
+    // Extract denial date
+    for (const pattern of CLAIM_PATTERNS.denialDate) {
+      const match = claimSearchText.match(pattern);
+      if (match) {
+        metadata.denialDate = formatDateForForm(match[1]);
+        console.log(`     📋 Found denial date: ${metadata.denialDate}`);
+        break;
+      }
     }
-  }
-  if (dateMatches.length > 0) {
-    metadata.policyStartDate = formatDateForForm(dateMatches[0]);
-    if (dateMatches.length > 1) {
-      metadata.policyEndDate = formatDateForForm(dateMatches[1]);
+    
+    // Extract denial reason
+    for (const pattern of CLAIM_PATTERNS.denialReason) {
+      const match = claimSearchText.match(pattern);
+      if (match) {
+        // Clean up the reason text - remove extra whitespace and truncate
+        metadata.denialReason = match[1].trim()
+          .replace(/\s+/g, ' ')
+          .substring(0, 300);
+        console.log(`     📋 Found denial reason: ${metadata.denialReason.substring(0, 50)}...`);
+        break;
+      }
     }
-  }
-  
-  // Extract insured name
-  for (const pattern of METADATA_PATTERNS.insuredName) {
-    const match = combinedText.match(pattern);
-    if (match) {
-      metadata.insuredName = match[1].trim();
-      break;
+    
+    // Extract event date
+    for (const pattern of CLAIM_PATTERNS.eventDate) {
+      const match = claimSearchText.match(pattern);
+      if (match) {
+        metadata.eventDate = formatDateForForm(match[1]);
+        console.log(`     📋 Found event date: ${metadata.eventDate}`);
+        break;
+      }
     }
   }
   
