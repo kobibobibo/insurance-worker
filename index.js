@@ -834,13 +834,14 @@ function detectMissingRequirements(documents, processedDocs) {
     });
   }
   
-  // Check for policy document
+  // Check for policy document - now a warning, not a blocker
+  // The system will still process any document and extract what it can
   const hasPolicy = documents.some(d => d.doc_type === 'policy');
   if (!hasPolicy) {
     missingRequirements.push({
       code: 'policy_not_found',
-      severity: 'blocker',
-      message: 'לא זוהה מסמך פוליסה ראשי.'
+      severity: 'warning',
+      message: 'לא זוהה מסמך פוליסה ראשי - הזכויות שיופקו עלולות להיות חלקיות.'
     });
   }
   
