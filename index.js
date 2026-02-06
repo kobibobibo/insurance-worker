@@ -3,12 +3,19 @@
  * 
  * Complete worker with clause-level citation extraction.
  * Polls Redis queue and processes policy documents through 6-stage pipeline.
+ * 
+ * Requirements compliance:
+ * - Evidence-only output: No right appears without complete evidence
+ * - Zero guessing on amounts: If schedule missing, amounts marked as unknown
+ * - 6-stage pipeline: Intake → Map → Harvest → Normalize → Validate → Export
+ * - Clause-level citations with document/page/section/quote
  */
 
 import { createClient } from '@supabase/supabase-js';
 import { Redis } from '@upstash/redis';
 import pdf from 'pdf-parse';
 import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
 
 // ============================================================
 // CONFIGURATION
@@ -86,10 +93,233 @@ const RIGHT_KEYWORDS = {
   ],
 };
 
+// Keywords indicating an exclusion (benefit NOT covered)
+const EXCLUSION_KEYWORDS = {
+  hebrew: [
+    'לא יכוסה', 'אינו מכוסה', 'לא יהיה זכאי', 'לא תהיה זכאית',
+    'חריג', 'חריגים', 'למעט', 'אינו כולל', 'לא כולל',
+    'לא יינתן', 'לא ישולם', 'לא יוחזר', 'לא יפוצה',
+    'פטור', 'פטורה', 'אין כיסוי', 'ללא כיסוי',
+  ],
+  english: [
+    'not covered', 'not entitled', 'excluded', 'exclusion',
+    'except', 'excluding', 'does not cover', 'will not cover',
+    'shall not', 'will not', 'no coverage', 'not eligible',
+    'waiver', 'exempt', 'not included', 'does not include',
+  ],
+};
+
+// Keywords indicating monetary amounts (for schedule_required detection)
+const AMOUNT_KEYWORDS = {
+  hebrew: [
+    '₪', 'ש"ח', 'שקל', 'שקלים',
+    'סכום', 'תקרה', 'מקסימום', 'עד לסכום',
+    'השתתפות עצמית', 'דמי השתתפות',
+  ],
+  english: [
+    '$', '€', '£', 'USD', 'ILS', 'NIS',
+    'amount', 'maximum', 'limit', 'up to',
+    'deductible', 'copay', 'co-payment',
+  ],
+};
+
+// Detect if text indicates an exclusion (not covered) vs inclusion (covered)
+function detectBenefitStatus(text) {
+  if (!text) return 'included';
+  const lowerText = text.toLowerCase();
+  
+  // Check for exclusion indicators
+  for (const keyword of [...EXCLUSION_KEYWORDS.hebrew, ...EXCLUSION_KEYWORDS.english]) {
+    if (text.includes(keyword) || lowerText.includes(keyword)) {
+      return 'excluded';
+    }
+  }
+  
+  return 'included';
+}
+
+// Detect if text contains amount references
+function hasAmountReference(text) {
+  if (!text) return false;
+  const lowerText = text.toLowerCase();
+  
+  for (const keyword of [...AMOUNT_KEYWORDS.hebrew, ...AMOUNT_KEYWORDS.english]) {
+    if (text.includes(keyword) || lowerText.includes(keyword)) {
+      return true;
+    }
+  }
+  
+  // Also check for numeric patterns that look like amounts
+  const amountPattern = /[\d,]+\.?\d*\s*(?:₪|ש"ח|שקל|\$|€|£)/;
+  return amountPattern.test(text);
+}
+
 const ANNEX_PATTERNS = {
   hebrew: [/נספח/, /תוספת/, /רשימה/, /דף פרטים/, /הרחבה/],
   english: [/annex/i, /appendix/i, /rider/i, /endorsement/i, /schedule/i, /addendum/i, /supplement/i],
 };
+
+// ============================================================
+// POLICY METADATA EXTRACTION PATTERNS
+// ============================================================
+
+const METADATA_PATTERNS = {
+  // Policy number patterns
+  policyNumber: [
+    /(?:מספר פוליסה|פוליסה מס['"]?|פוליסה)[:\s]*([A-Z0-9\-\/]+)/i,
+    /(?:policy\s*(?:no\.?|number|#))[:\s]*([A-Z0-9\-\/]+)/i,
+    /פוליסה\s*[:\s]\s*(\d{6,15})/,
+    /(?:מס['\.]?\s*פוליסה)[:\s]*([A-Z0-9\-\/]+)/i,
+  ],
+  // Insurer name patterns (Israeli insurers)
+  insurerName: [
+    /(הראל(?:\s+ביטוח)?)/,
+    /(מגדל(?:\s+ביטוח)?)/,
+    /(כלל(?:\s+ביטוח)?)/,
+    /(הפניקס(?:\s+ביטוח)?)/,
+    /(מנורה(?:\s+מבטחים)?)/,
+    /(איילון(?:\s+ביטוח)?)/,
+    /(הכשרה(?:\s+ביטוח)?)/,
+    /(שלמה(?:\s+ביטוח)?)/,
+    /(ביטוח\s+ישיר)/,
+    /(AIG|Clal|Phoenix|Migdal|Harel|Menora)/i,
+  ],
+  // Policy type patterns
+  policyType: [
+    /(ביטוח\s+בריאות|health\s+insurance)/i,
+    /(ביטוח\s+חיים|life\s+insurance)/i,
+    /(ביטוח\s+סיעודי|nursing\s+(?:care\s+)?insurance)/i,
+    /(אובדן\s+כושר\s+עבודה|disability\s+insurance)/i,
+    /(ביטוח\s+תאונות(?:\s+אישיות)?|accident\s+insurance)/i,
+    /(ביטוח\s+נסיעות|travel\s+insurance)/i,
+    /(ביטוח\s+רכב|car\s+insurance|motor\s+insurance)/i,
+    /(ביטוח\s+דירה|home\s+insurance)/i,
+  ],
+  // Date patterns (for policy start/end)
+  policyDates: [
+    /(?:תאריך\s+(?:תחילת?\s+)?תוקף|מיום|תחילה)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/,
+    /(?:effective\s+(?:from|date))[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/i,
+    /(?:valid\s+from)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/i,
+    /(?:תאריך\s+סיום|עד\s+ליום|תום\s+תוקף)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/,
+  ],
+  // Insured name patterns
+  insuredName: [
+    /(?:שם\s+(?:המבוטח|מבוטח)|מבוטח)[:\s]*([א-ת\s]{3,40})/,
+    /(?:insured(?:\s+name)?)[:\s]*([A-Za-z\s]{3,40})/i,
+    /(?:שם\s+מלא)[:\s]*([א-ת\s]{3,40})/,
+  ],
+};
+
+/**
+ * Extract policy metadata from document text
+ */
+function extractPolicyMetadata(documents) {
+  const metadata = {
+    insurerName: "",
+    policyNumber: "",
+    policyType: "",
+    policyStartDate: "",
+    policyEndDate: "",
+    insuredName: "",
+    extractedAt: new Date().toISOString(),
+  };
+  
+  // Combine text from all documents (focus on first few pages)
+  const combinedText = documents
+    .map(doc => {
+      if (doc.page_texts && doc.page_texts.length > 0) {
+        return doc.page_texts.slice(0, 5).join('\n');
+      }
+      return doc.text?.substring(0, 10000) || '';
+    })
+    .join('\n');
+  
+  if (!combinedText) return metadata;
+  
+  // Extract insurer name
+  for (const pattern of METADATA_PATTERNS.insurerName) {
+    const match = combinedText.match(pattern);
+    if (match) {
+      metadata.insurerName = match[1].trim();
+      break;
+    }
+  }
+  
+  // Extract policy number
+  for (const pattern of METADATA_PATTERNS.policyNumber) {
+    const match = combinedText.match(pattern);
+    if (match) {
+      metadata.policyNumber = match[1].trim();
+      break;
+    }
+  }
+  
+  // Extract policy type
+  for (const pattern of METADATA_PATTERNS.policyType) {
+    const match = combinedText.match(pattern);
+    if (match) {
+      metadata.policyType = match[1].trim();
+      break;
+    }
+  }
+  
+  // Extract dates
+  const dateMatches = [];
+  for (const pattern of METADATA_PATTERNS.policyDates) {
+    const match = combinedText.match(pattern);
+    if (match) {
+      dateMatches.push(match[1]);
+    }
+  }
+  if (dateMatches.length > 0) {
+    metadata.policyStartDate = formatDateForForm(dateMatches[0]);
+    if (dateMatches.length > 1) {
+      metadata.policyEndDate = formatDateForForm(dateMatches[1]);
+    }
+  }
+  
+  // Extract insured name
+  for (const pattern of METADATA_PATTERNS.insuredName) {
+    const match = combinedText.match(pattern);
+    if (match) {
+      metadata.insuredName = match[1].trim();
+      break;
+    }
+  }
+  
+  return metadata;
+}
+
+/**
+ * Convert date string to YYYY-MM-DD format for form input
+ */
+function formatDateForForm(dateStr) {
+  if (!dateStr) return "";
+  
+  // Parse common date formats
+  const patterns = [
+    { regex: /(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{4})/, order: [3, 2, 1] }, // DD/MM/YYYY
+    { regex: /(\d{4})[\/\.\-](\d{1,2})[\/\.\-](\d{1,2})/, order: [1, 2, 3] }, // YYYY-MM-DD
+    { regex: /(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{2})/, order: [3, 2, 1], addCentury: true }, // DD/MM/YY
+  ];
+  
+  for (const { regex, order, addCentury } of patterns) {
+    const match = dateStr.match(regex);
+    if (match) {
+      let year = match[order[0]];
+      let month = match[order[1]].padStart(2, '0');
+      let day = match[order[2]].padStart(2, '0');
+      
+      if (addCentury && year.length === 2) {
+        year = parseInt(year) > 50 ? '19' + year : '20' + year;
+      }
+      
+      return `${year}-${month}-${day}`;
+    }
+  }
+  
+  return dateStr;
+}
 
 // ============================================================
 // CLAUSE EXTRACTION FUNCTIONS
@@ -402,6 +632,21 @@ function normalizeHebrewText(text) {
     .trim();
 }
 
+/**
+ * Compute SHA256 hash of a buffer
+ */
+function computeSha256(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+/**
+ * Generate policy fingerprint from all document hashes
+ */
+function generatePolicyFingerprint(documentHashes) {
+  const combined = documentHashes.sort().join(':');
+  return crypto.createHash('sha256').update(combined).digest('hex').substring(0, 16);
+}
+
 // ============================================================
 // BENEFIT EXTRACTION
 // ============================================================
@@ -449,7 +694,44 @@ function detectBenefitLayer(text) {
   return 'conditional';
 }
 
-function extractBenefits(text, documentId, pageTexts, displayName, docType) {
+/**
+ * Extract amounts from text and determine their value state
+ * @param {string} text - The text to extract amounts from
+ * @param {boolean} hasSchedule - Whether a schedule document is present
+ * @returns {object} Amounts object with values or unknown_schedule_required state
+ */
+function extractAmounts(text, hasSchedule) {
+  const amounts = {
+    value_state: hasSchedule ? 'known' : 'unknown_schedule_required',
+    values: []
+  };
+  
+  if (!text || !hasSchedule) {
+    return amounts;
+  }
+  
+  // Only extract amounts if we have a schedule
+  const amountPatterns = [
+    /(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*(?:₪|ש"ח|שקלים?)/g,
+    /(?:up to|עד לסכום של?)\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/gi,
+    /(?:maximum|מקסימום|תקרה)\s*(?:of)?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/gi,
+  ];
+  
+  for (const pattern of amountPatterns) {
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      amounts.values.push({
+        raw: match[0],
+        numeric: parseFloat(match[1].replace(/,/g, '')),
+        position: match.index
+      });
+    }
+  }
+  
+  return amounts;
+}
+
+function extractBenefits(text, documentId, pageTexts, displayName, docType, hasSchedule) {
   if (!text) return [];
   
   const benefits = [];
@@ -497,45 +779,100 @@ function extractBenefits(text, documentId, pageTexts, displayName, docType) {
       0.85
     );
     
-    // NOTE: status field is NOT included here - the database default will be used
+    // Detect if this is an included benefit or an exclusion
     const benefitId = uuidv4();
+    const benefitStatus = detectBenefitStatus(sentence);
+    
+    // Extract amounts with schedule awareness
+    const amounts = hasAmountReference(sentence) 
+      ? extractAmounts(sentence, hasSchedule) 
+      : {};
+    
     const benefit = {
       benefit_id: benefitId,
       layer: detectBenefitLayer(sentence),
       title: normalizeHebrewText(title),
       summary: normalizeHebrewText(sentence),
+      status: benefitStatus, // 'included' or 'excluded' based on policy text
       evidence_set: {
         spans: [evidenceSpan]
       },
       tags: [],
       eligibility: {},
-      amounts: {},
+      amounts: amounts,
       actionable_steps: []
     };
-    
-    // DEBUG: Log benefit creation - status should be undefined at this point
-    if (benefits.length === 0) {
-      console.log(`     🔬 [extractBenefits] First benefit created:`);
-      console.log(`        - benefit_id: ${benefitId}`);
-      console.log(`        - status field exists: ${('status' in benefit)}`);
-      console.log(`        - status value: ${benefit.status}`);
-      console.log(`        - Object.keys: ${Object.keys(benefit).join(', ')}`);
-    }
     
     benefits.push(benefit);
   }
   
+  // Log summary
+  const included = benefits.filter(b => b.status === 'included').length;
+  const excluded = benefits.filter(b => b.status === 'excluded').length;
+  console.log(`     📊 Benefits extracted: ${included} included, ${excluded} excluded`);
+  
   return benefits;
+}
+
+// ============================================================
+// MISSING REQUIREMENTS DETECTION
+// ============================================================
+
+/**
+ * Check for missing requirements and return structured missing_requirements array
+ */
+function detectMissingRequirements(documents, processedDocs) {
+  const missingRequirements = [];
+  
+  // Check for schedule
+  const hasSchedule = documents.some(d => d.doc_type === 'schedule');
+  if (!hasSchedule) {
+    missingRequirements.push({
+      code: 'schedule_required',
+      severity: 'warning',
+      message: 'לא זוהה דף פרטי ביטוח (Policy Schedule). סכומים ותקרות לא יוצגו.'
+    });
+  }
+  
+  // Check for policy document
+  const hasPolicy = documents.some(d => d.doc_type === 'policy');
+  if (!hasPolicy) {
+    missingRequirements.push({
+      code: 'policy_not_found',
+      severity: 'blocker',
+      message: 'לא זוהה מסמך פוליסה ראשי.'
+    });
+  }
+  
+  // Check for unreadable documents
+  for (const doc of documents) {
+    const processed = processedDocs.find(p => p.document_id === doc.document_id);
+    if (!processed || !processed.text || processed.text.length < 100) {
+      missingRequirements.push({
+        code: 'document_unreadable',
+        severity: 'warning',
+        message: `לא ניתן היה לקרוא את המסמך: ${doc.display_name}`,
+        related_document_id: doc.document_id
+      });
+    }
+  }
+  
+  return missingRequirements;
 }
 
 // ============================================================
 // PIPELINE STAGES
 // ============================================================
 
-async function updateRunStatus(run_id, status, stage) {
+async function updateRunStatus(run_id, status, stage, extra = {}) {
   const { error } = await supabase
     .from('runs')
-    .update({ status, stage, updated_at: new Date().toISOString() })
+    .update({ 
+      status, 
+      stage, 
+      updated_at: new Date().toISOString(),
+      ...extra
+    })
     .eq('run_id', run_id);
   
   if (error) {
@@ -562,6 +899,11 @@ async function stageIntake(run_id) {
   }
   
   const processedDocs = [];
+  const documentHashes = [];
+  
+  // Check for schedule presence
+  const hasSchedule = documents.some(d => d.doc_type === 'schedule');
+  console.log(`     📋 Schedule document present: ${hasSchedule ? 'Yes' : 'No'}`);
   
   for (const doc of documents) {
     console.log(`     📄 Processing: ${doc.display_name || doc.storage_key}`);
@@ -577,8 +919,12 @@ async function stageIntake(run_id) {
         continue;
       }
       
-      // Parse PDF
+      // Get buffer and compute SHA256
       const buffer = Buffer.from(await fileData.arrayBuffer());
+      const sha256 = computeSha256(buffer);
+      documentHashes.push(sha256);
+      
+      // Parse PDF
       const pdfData = await pdf(buffer);
       
       // Extract text per page
@@ -594,10 +940,11 @@ async function stageIntake(run_id) {
         doc_type: doc.doc_type || 'policy',
         text: normalizeHebrewText(pdfData.text),
         page_texts: pageTexts.length > 0 ? pageTexts : [normalizeHebrewText(pdfData.text)],
-        pages: pageTexts.length || 1
+        pages: pageTexts.length || 1,
+        sha256: sha256
       });
       
-      // Update document with page count
+      // Update document with page count (sha256 would need DB column)
       await supabase
         .from('documents')
         .update({ pages: pageTexts.length || 1 })
@@ -608,17 +955,50 @@ async function stageIntake(run_id) {
     }
   }
   
+  // Generate policy fingerprint
+  const policyFingerprint = generatePolicyFingerprint(documentHashes);
+  console.log(`     🔐 Policy fingerprint: ${policyFingerprint}`);
+  
+  // Extract policy metadata for auto-fill
+  const policyMetadata = extractPolicyMetadata(processedDocs);
+  console.log(`     📋 Extracted metadata:`, {
+    insurer: policyMetadata.insurerName || 'not found',
+    policyNo: policyMetadata.policyNumber || 'not found',
+    type: policyMetadata.policyType || 'not found',
+  });
+  
+  // Detect missing requirements
+  const missingRequirements = detectMissingRequirements(documents, processedDocs);
+  if (missingRequirements.length > 0) {
+    console.log(`     ⚠️ Missing requirements: ${missingRequirements.map(m => m.code).join(', ')}`);
+  }
+  
+  // Update run with missing_requirements and policy_metadata
+  await updateRunStatus(run_id, 'queued', 'intake', {
+    missing_requirements: missingRequirements.map(m => m.code),
+    policy_metadata: policyMetadata
+  });
+  
   console.log(`     ✓ Extracted ${processedDocs.length} documents`);
-  return processedDocs;
+  
+  return {
+    documents: processedDocs,
+    hasSchedule,
+    policyFingerprint,
+    missingRequirements,
+    policyMetadata
+  };
 }
 
-async function stageMap(run_id, documents) {
+async function stageMap(run_id, intakeResult) {
   console.log('  2️⃣  Map - Analyzing structure...');
   await updateRunStatus(run_id, 'queued', 'map');
   
+  const { documents } = intakeResult;
+  
   if (!documents || !Array.isArray(documents)) {
     console.log('     ⚠️ No documents to map');
-    return { sections: 0, documents: [] };
+    return { ...intakeResult, sections: 0 };
   }
   
   let totalSections = 0;
@@ -637,30 +1017,32 @@ async function stageMap(run_id, documents) {
   }
   
   console.log(`     ✓ Mapped ${totalSections} sections`);
-  return { sections: totalSections, documents };
+  return { ...intakeResult, sections: totalSections };
 }
 
-async function stageHarvest(run_id, documents, structure) {
+async function stageHarvest(run_id, mapResult) {
   console.log('  3️⃣  Harvest - Extracting rights...');
   await updateRunStatus(run_id, 'queued', 'harvest');
   
+  const { documents, hasSchedule } = mapResult;
   const benefits = [];
   
   if (!documents || !Array.isArray(documents)) {
     console.log('     ⚠️ No documents to harvest');
-    return benefits;
+    return { ...mapResult, benefits };
   }
   
   for (const doc of documents) {
     if (!doc.text) continue;
     
-    // Pass display_name and doc_type for enrichment
+    // Pass display_name, doc_type, and hasSchedule for enrichment
     const foundBenefits = extractBenefits(
       doc.text,
       doc.document_id,
       doc.page_texts,
       doc.display_name,
-      doc.doc_type
+      doc.doc_type,
+      hasSchedule
     );
     
     if (foundBenefits && Array.isArray(foundBenefits)) {
@@ -674,90 +1056,121 @@ async function stageHarvest(run_id, documents, structure) {
   const service = benefits.filter(b => b.layer === 'service').length;
   
   console.log(`     📊 Layers: certain=${certain}, conditional=${conditional}, service=${service}`);
+  console.log(`     ✓ Harvested ${benefits.length} total benefits`);
   
-  return benefits;
+  return { ...mapResult, benefits };
 }
 
-async function stageNormalize(run_id, benefits) {
+async function stageNormalize(run_id, harvestResult) {
   console.log('  4️⃣  Normalize - Standardizing data...');
   await updateRunStatus(run_id, 'queued', 'normalize');
   
+  const { benefits, hasSchedule } = harvestResult;
+  
   if (!benefits || !Array.isArray(benefits)) {
     console.log('     ⚠️ No benefits to normalize');
-    return [];
+    return { ...harvestResult, normalizedBenefits: [] };
   }
   
-  // Normalize each benefit - NOTE: status is NOT set, database default will be used
-  const normalizedBenefits = benefits.map((benefit, idx) => {
-    const normalized = {
-      ...benefit,
+  // Normalize each benefit - preserve status from extraction
+  const normalizedBenefits = benefits.map((benefit) => {
+    // Ensure amounts have proper value_state based on schedule presence
+    let amounts = benefit.amounts || {};
+    if (hasAmountReference(benefit.summary) && !hasSchedule) {
+      amounts = {
+        value_state: 'unknown_schedule_required',
+        values: []
+      };
+    }
+    
+    return {
       benefit_id: benefit.benefit_id || uuidv4(),
       title: normalizeHebrewText(benefit.title || 'Untitled Benefit'),
       summary: normalizeHebrewText(benefit.summary || ''),
       layer: benefit.layer || 'conditional',
-      status: 'included', // EXPLICIT: Always set to 'included' to satisfy benefits_status_check
+      status: benefit.status || 'included',
       evidence_set: benefit.evidence_set || { spans: [] },
       tags: benefit.tags || [],
       eligibility: benefit.eligibility || {},
-      amounts: benefit.amounts || [],
+      amounts: amounts,
       actionable_steps: benefit.actionable_steps || []
     };
-    
-    // DEBUG: Log first benefit normalization
-    if (idx === 0) {
-      console.log(`     🔬 [stageNormalize] First benefit after spread:`);
-      console.log(`        - Input status exists: ${('status' in benefit)}`);
-      console.log(`        - Input status value: ${benefit.status}`);
-      console.log(`        - Output status exists: ${('status' in normalized)}`);
-      console.log(`        - Output status value: ${normalized.status}`);
-      console.log(`        - Output keys: ${Object.keys(normalized).join(', ')}`);
-    }
-    
-    return normalized;
   });
   
   console.log(`     ✓ Normalized ${normalizedBenefits.length} benefits`);
-  return normalizedBenefits;
+  return { ...harvestResult, normalizedBenefits };
 }
 
-async function stageValidate(run_id, benefits) {
+async function stageValidate(run_id, normalizeResult) {
   console.log('  5️⃣  Validate - Checking quality...');
   await updateRunStatus(run_id, 'queued', 'validate');
   
-  if (!benefits || !Array.isArray(benefits)) {
+  const { normalizedBenefits, missingRequirements } = normalizeResult;
+  
+  if (!normalizedBenefits || !Array.isArray(normalizedBenefits)) {
     console.log('     ⚠️ No benefits to validate');
-    return { valid: [], invalid: [], score: 0 };
+    return { 
+      ...normalizeResult, 
+      validatedBenefits: { valid: [], invalid: [], score: 0 },
+      qualityMetrics: { evidence_coverage_ratio: 0, benefits_count: 0, warnings: [] }
+    };
   }
   
-  // Filter benefits with valid evidence
-  const benefitsWithEvidence = benefits.filter(b => {
+  // REQUIREMENT: 100% evidence coverage - filter benefits with valid evidence
+  const benefitsWithEvidence = normalizedBenefits.filter(b => {
     const spans = b.evidence_set?.spans;
-    return spans && Array.isArray(spans) && spans.length > 0;
+    return spans && Array.isArray(spans) && spans.length > 0 && 
+           spans.every(s => s.quote && s.document_id && s.page);
   });
   
-  // Benefits without evidence
-  const benefitsWithoutEvidence = benefits.filter(b => {
+  // Benefits without complete evidence (rejected)
+  const benefitsWithoutEvidence = normalizedBenefits.filter(b => {
     const spans = b.evidence_set?.spans;
-    return !spans || !Array.isArray(spans) || spans.length === 0;
+    return !spans || !Array.isArray(spans) || spans.length === 0 ||
+           !spans.every(s => s.quote && s.document_id && s.page);
   });
   
-  const validationScore = benefits.length > 0 
-    ? (benefitsWithEvidence.length / benefits.length) * 100 
+  // Calculate quality metrics
+  const evidenceCoverageRatio = normalizedBenefits.length > 0 
+    ? benefitsWithEvidence.length / normalizedBenefits.length 
     : 0;
   
-  console.log(`     ✓ Valid: ${benefitsWithEvidence.length}, Invalid: ${benefitsWithoutEvidence.length}, Score: ${validationScore.toFixed(1)}%`);
+  const warnings = [];
+  
+  // Add warnings based on missing requirements
+  if (missingRequirements?.some(m => m.code === 'schedule_required')) {
+    warnings.push('סכומים ותקרות לא מוצגים - חסר דף פרטי ביטוח');
+  }
+  
+  if (benefitsWithoutEvidence.length > 0) {
+    warnings.push(`${benefitsWithoutEvidence.length} זכויות נדחו עקב חוסר ראיות מלאות`);
+  }
+  
+  const qualityMetrics = {
+    evidence_coverage_ratio: evidenceCoverageRatio,
+    benefits_count: benefitsWithEvidence.length,
+    warnings
+  };
+  
+  console.log(`     ✓ Valid: ${benefitsWithEvidence.length}, Invalid: ${benefitsWithoutEvidence.length}`);
+  console.log(`     📊 Evidence coverage: ${(evidenceCoverageRatio * 100).toFixed(1)}%`);
   
   return {
-    valid: benefitsWithEvidence,
-    invalid: benefitsWithoutEvidence,
-    score: validationScore
+    ...normalizeResult,
+    validatedBenefits: {
+      valid: benefitsWithEvidence,
+      invalid: benefitsWithoutEvidence,
+      score: evidenceCoverageRatio * 100
+    },
+    qualityMetrics
   };
 }
 
-async function stageExport(run_id, validatedBenefits, documents) {
+async function stageExport(run_id, validateResult) {
   console.log('  6️⃣  Export - Saving to database...');
   await updateRunStatus(run_id, 'queued', 'export');
   
+  const { validatedBenefits, qualityMetrics, documents, policyFingerprint } = validateResult;
   const benefits = validatedBenefits?.valid || [];
   
   if (!benefits || benefits.length === 0) {
@@ -770,47 +1183,23 @@ async function stageExport(run_id, validatedBenefits, documents) {
   let insertedCount = 0;
   
   for (let i = 0; i < benefits.length; i += batchSize) {
-    // DEBUG: Log input benefit before mapping
-    if (i === 0 && benefits[0]) {
-      console.log(`     🔬 [stageExport] Input benefit BEFORE mapping:`);
-      console.log(`        - Input status exists: ${('status' in benefits[0])}`);
-      console.log(`        - Input status value: ${benefits[0].status}`);
-    }
-    
-    const batch = benefits.slice(i, i + batchSize).map((b, idx) => {
-      const STATUS_VALUE = 'included'; // Hardcoded constant
-      const mapped = {
+    const batch = benefits.slice(i, i + batchSize).map((b) => {
+      // Validate status is one of allowed values
+      const status = b.status === 'excluded' ? 'excluded' : 'included';
+      return {
         benefit_id: b.benefit_id,
         run_id: run_id,
         layer: b.layer,
         title: b.title,
         summary: b.summary,
-        status: STATUS_VALUE, // REQUIRED: Must be 'included' or 'excluded' per benefits_status_check constraint
+        status: status, // 'included' or 'excluded' per benefits_status_check constraint
         evidence_set: b.evidence_set,
         tags: b.tags,
         eligibility: b.eligibility,
         amounts: b.amounts,
         actionable_steps: b.actionable_steps
       };
-      
-      // DEBUG: Log first mapped benefit
-      if (i === 0 && idx === 0) {
-        console.log(`     🔬 [stageExport] Mapped benefit AFTER explicit assignment:`);
-        console.log(`        - STATUS_VALUE constant: "${STATUS_VALUE}"`);
-        console.log(`        - mapped.status: "${mapped.status}"`);
-        console.log(`        - typeof mapped.status: ${typeof mapped.status}`);
-        console.log(`        - Full mapped object: ${JSON.stringify(mapped, null, 2).substring(0, 500)}`);
-      }
-      
-      return mapped;
     });
-    
-    // DEBUG: Final check before insert
-    if (i === 0) {
-      console.log(`     🔬 [stageExport] batch[0] FINAL before insert:`);
-      console.log(`        - batch[0].status: "${batch[0]?.status}"`);
-      console.log(`        - JSON: ${JSON.stringify(batch[0]).substring(0, 300)}`);
-    }
     
     const { error } = await supabase
       .from('benefits')
@@ -819,39 +1208,24 @@ async function stageExport(run_id, validatedBenefits, documents) {
     if (error) {
       console.error(`     ⚠️ Batch insert error: ${error.message}`);
       console.error(`     🔍 Error code: ${error.code}, hint: ${error.hint}, details: ${error.details}`);
-      // Try inserting a minimal benefit to isolate the issue
-      const minimalBenefit = {
-        benefit_id: batch[0].benefit_id,
-        run_id: batch[0].run_id,
-        layer: batch[0].layer,
-        title: batch[0].title?.substring(0, 50) || 'Test',
-        status: 'included',
-        evidence_set: { spans: [] }
-      };
-      console.error(`     📋 Trying minimal insert: ${JSON.stringify(minimalBenefit)}`);
-      const { error: minError } = await supabase.from('benefits').insert([minimalBenefit]);
-      if (minError) {
-        console.error(`     ❌ Minimal insert also failed: ${minError.message} (code: ${minError.code})`);
-      } else {
-        console.error(`     ✅ Minimal insert succeeded - issue is with extra fields`);
-      }
     } else {
       insertedCount += batch.length;
     }
   }
   
-  // Calculate quality metrics
+  // Calculate total pages processed
   const totalPages = (documents || []).reduce((sum, d) => sum + (d.pages || 1), 0);
-  const qualityMetrics = {
-    total_pages_processed: totalPages,
-    extraction_confidence: validatedBenefits?.score || 0,
-    validation_score: validatedBenefits?.score || 0
-  };
   
   // Update run with quality metrics
+  const runQualityMetrics = {
+    total_pages_processed: totalPages,
+    extraction_confidence: qualityMetrics?.evidence_coverage_ratio || 0,
+    validation_score: qualityMetrics?.evidence_coverage_ratio || 0
+  };
+  
   await supabase
     .from('runs')
-    .update({ quality_metrics: qualityMetrics })
+    .update({ quality_metrics: runQualityMetrics })
     .eq('run_id', run_id);
   
   console.log(`     ✓ Exported ${insertedCount} benefits`);
@@ -868,25 +1242,31 @@ async function processPolicyPipeline(run_id) {
   
   try {
     // Stage 1: Intake
-    const documents = await stageIntake(run_id);
-    if (!documents || documents.length === 0) {
+    const intakeResult = await stageIntake(run_id);
+    if (!intakeResult.documents || intakeResult.documents.length === 0) {
       throw new Error('No documents could be processed');
     }
     
+    // Check for blockers
+    const blockers = intakeResult.missingRequirements?.filter(m => m.severity === 'blocker') || [];
+    if (blockers.length > 0) {
+      throw new Error(`Blocking issues: ${blockers.map(b => b.message).join('; ')}`);
+    }
+    
     // Stage 2: Map
-    const structure = await stageMap(run_id, documents);
+    const mapResult = await stageMap(run_id, intakeResult);
     
     // Stage 3: Harvest
-    const benefits = await stageHarvest(run_id, documents, structure);
+    const harvestResult = await stageHarvest(run_id, mapResult);
     
     // Stage 4: Normalize
-    const normalizedBenefits = await stageNormalize(run_id, benefits);
+    const normalizeResult = await stageNormalize(run_id, harvestResult);
     
     // Stage 5: Validate
-    const validatedBenefits = await stageValidate(run_id, normalizedBenefits);
+    const validateResult = await stageValidate(run_id, normalizeResult);
     
     // Stage 6: Export
-    const exportResult = await stageExport(run_id, validatedBenefits, documents);
+    const exportResult = await stageExport(run_id, validateResult);
     
     // Mark run as completed
     await updateRunStatus(run_id, 'completed', 'export');
