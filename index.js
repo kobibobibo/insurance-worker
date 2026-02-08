@@ -184,16 +184,24 @@ const METADATA_PATTERNS = {
     /(ביטוח\s+ישיר)/,
     /(AIG|Clal|Phoenix|Migdal|Harel|Menora)/i,
   ],
-  // Policy type patterns
+  // Policy type patterns - returns normalized type key
   policyType: [
-    /(ביטוח\s+בריאות|health\s+insurance)/i,
-    /(ביטוח\s+חיים|life\s+insurance)/i,
-    /(ביטוח\s+סיעודי|nursing\s+(?:care\s+)?insurance)/i,
-    /(אובדן\s+כושר\s+עבודה|disability\s+insurance)/i,
-    /(ביטוח\s+תאונות(?:\s+אישיות)?|accident\s+insurance)/i,
-    /(ביטוח\s+נסיעות|travel\s+insurance)/i,
-    /(ביטוח\s+רכב|car\s+insurance|motor\s+insurance)/i,
-    /(ביטוח\s+דירה|home\s+insurance)/i,
+    // Health insurance - multiple variations
+    { pattern: /ביטוח\s+בריאות|בריאות\s+פרט|כיסוי\s+בריאות|health\s+insurance/i, type: 'health' },
+    // Life insurance
+    { pattern: /ביטוח\s+חיים|חיים\s+ומוות|life\s+insurance/i, type: 'life' },
+    // Nursing/Long-term care
+    { pattern: /ביטוח\s+סיעודי|סיעוד|nursing\s+(?:care\s+)?insurance|long[- ]?term\s+care/i, type: 'nursing' },
+    // Disability/Loss of work capacity
+    { pattern: /אובדן\s+כושר\s+עבודה|אובדן\s+כושר|אכ"ע|disability\s+insurance|income\s+protection/i, type: 'disability' },
+    // Personal accident
+    { pattern: /ביטוח\s+תאונות(?:\s+אישיות)?|תאונות\s+אישיות|accident\s+insurance|personal\s+accident/i, type: 'accident' },
+    // Travel insurance
+    { pattern: /ביטוח\s+נסיעות|נסיעות\s+לחו"ל|travel\s+insurance/i, type: 'travel' },
+    // Car insurance (for future use)
+    { pattern: /ביטוח\s+רכב|car\s+insurance|motor\s+insurance/i, type: 'car' },
+    // Home insurance (for future use)
+    { pattern: /ביטוח\s+דירה|home\s+insurance/i, type: 'home' },
   ],
   // Date patterns (for policy start/end)
   policyDates: [
@@ -330,11 +338,12 @@ function extractPolicyMetadata(documents) {
       }
     }
     
-    // Extract policy type
-    for (const pattern of METADATA_PATTERNS.policyType) {
-      const match = textToSearch.match(pattern);
+    // Extract policy type - now uses object pattern with normalized type key
+    for (const typePattern of METADATA_PATTERNS.policyType) {
+      const match = textToSearch.match(typePattern.pattern);
       if (match) {
-        metadata.policyType = match[1].trim();
+        metadata.policyType = typePattern.type; // Use normalized key like 'health', 'life', etc.
+        console.log(`[extractPolicyMetadata] Found policy type: ${typePattern.type} from match: ${match[0]}`);
         break;
       }
     }
@@ -865,36 +874,64 @@ function extractAmounts(text, hasSchedule) {
   return amounts;
 }
 
+/**
+ * Extract benefits using paragraph-based chunking to keep complete thoughts together.
+ * Instead of splitting on every sentence, we split on paragraph breaks (double newlines
+ * or heading patterns) and keep each clause as a single benefit.
+ */
 function extractBenefits(text, documentId, pageTexts, displayName, docType, hasSchedule) {
   if (!text) return [];
   
   const benefits = [];
-  const sentences = text.split(/[.。\n]/);
   
-  // Track found benefits to avoid duplicates
-  const foundTitles = new Set();
+  // Split by paragraphs (double newlines, or numbered/lettered list items)
+  // This keeps complete clauses together instead of fragmenting sentences
+  const paragraphs = text.split(/\n\s*\n|(?=\n\s*[\u05D0-\u05EA\d]+[\.)\-]\s)|(?=\n\s*[a-zA-Z\d]+[\.)\-]\s)/);
   
-  for (let i = 0; i < sentences.length; i++) {
-    const sentence = sentences[i]?.trim();
-    if (!sentence || sentence.length < 20) continue;
+  // Track found benefits to avoid exact duplicates
+  const foundQuotes = new Set();
+  
+  for (let i = 0; i < paragraphs.length; i++) {
+    const paragraph = paragraphs[i]?.trim();
     
-    // Check if this sentence contains right-conferring language
+    // Skip very short or very long paragraphs
+    if (!paragraph || paragraph.length < 30 || paragraph.length > 2000) continue;
+    
+    // Check if this paragraph contains right-conferring language
     const hasRightKeyword = [...RIGHT_KEYWORDS.hebrew, ...RIGHT_KEYWORDS.english]
-      .some(kw => sentence.includes(kw) || sentence.toLowerCase().includes(kw));
+      .some(kw => paragraph.includes(kw) || paragraph.toLowerCase().includes(kw));
     
     if (!hasRightKeyword) continue;
     
-    // Generate a title from the sentence
-    const title = sentence.substring(0, 80).trim();
-    if (foundTitles.has(title)) continue;
-    foundTitles.add(title);
+    // Create a normalized key for duplicate detection (first 100 chars, normalized)
+    const normalizedKey = paragraph.substring(0, 100)
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .trim();
     
-    // Find which page this sentence is on
+    if (foundQuotes.has(normalizedKey)) continue;
+    foundQuotes.add(normalizedKey);
+    
+    // Generate a concise title from the paragraph
+    // Try to find a natural break point (comma, dash, colon) within first 80 chars
+    let title = paragraph.substring(0, 80);
+    const breakMatch = title.match(/^(.{20,70}?)[,:\-–—]/);
+    if (breakMatch) {
+      title = breakMatch[1].trim();
+    } else if (title.length === 80) {
+      // Find last word boundary
+      const lastSpace = title.lastIndexOf(' ');
+      if (lastSpace > 40) {
+        title = title.substring(0, lastSpace) + '...';
+      }
+    }
+    
+    // Find which page this paragraph is on
     let page = 1;
     let pageText = text;
     if (pageTexts && Array.isArray(pageTexts)) {
       for (let p = 0; p < pageTexts.length; p++) {
-        if (pageTexts[p] && pageTexts[p].includes(sentence.substring(0, 50))) {
+        if (pageTexts[p] && pageTexts[p].includes(paragraph.substring(0, 50))) {
           page = p + 1;
           pageText = pageTexts[p];
           break;
@@ -905,7 +942,7 @@ function extractBenefits(text, documentId, pageTexts, displayName, docType, hasS
     // Create enriched evidence span
     const evidenceSpan = enrichEvidenceSpan(
       pageText,
-      sentence,
+      paragraph,
       documentId,
       displayName || 'Policy Document',
       docType || 'policy',
@@ -915,19 +952,19 @@ function extractBenefits(text, documentId, pageTexts, displayName, docType, hasS
     
     // Detect if this is an included benefit or an exclusion
     const benefitId = uuidv4();
-    const benefitStatus = detectBenefitStatus(sentence);
+    const benefitStatus = detectBenefitStatus(paragraph);
     
     // Extract amounts with schedule awareness
-    const amounts = hasAmountReference(sentence) 
-      ? extractAmounts(sentence, hasSchedule) 
+    const amounts = hasAmountReference(paragraph) 
+      ? extractAmounts(paragraph, hasSchedule) 
       : {};
     
     const benefit = {
       benefit_id: benefitId,
-      layer: detectBenefitLayer(sentence),
+      layer: detectBenefitLayer(paragraph),
       title: normalizeHebrewText(title),
-      summary: normalizeHebrewText(sentence),
-      status: benefitStatus, // 'included' or 'excluded' based on policy text
+      summary: normalizeHebrewText(paragraph),
+      status: benefitStatus,
       evidence_set: {
         spans: [evidenceSpan]
       },
@@ -1196,8 +1233,14 @@ async function stageHarvest(run_id, mapResult) {
   return { ...mapResult, benefits };
 }
 
+// Maximum benefits to process (prevents runaway extraction)
+const MAX_BENEFITS = 200;
+
+// Supabase Edge Function URL for AI-powered deduplication
+const DEDUPE_FUNCTION_URL = `${SUPABASE_URL}/functions/v1/dedupe-benefits`;
+
 async function stageNormalize(run_id, harvestResult) {
-  console.log('  4️⃣  Normalize - Standardizing data...');
+  console.log('  4️⃣  Normalize - Standardizing and deduplicating...');
   await updateRunStatus(run_id, 'queued', 'normalize');
   
   const { benefits, hasSchedule } = harvestResult;
@@ -1207,8 +1250,10 @@ async function stageNormalize(run_id, harvestResult) {
     return { ...harvestResult, normalizedBenefits: [] };
   }
   
-  // Normalize each benefit - preserve status from extraction
-  const normalizedBenefits = benefits.map((benefit) => {
+  console.log(`     📊 Raw benefits count: ${benefits.length}`);
+  
+  // Step 1: Basic normalization
+  let normalizedBenefits = benefits.map((benefit) => {
     // Ensure amounts have proper value_state based on schedule presence
     let amounts = benefit.amounts || {};
     if (hasAmountReference(benefit.summary) && !hasSchedule) {
@@ -1232,8 +1277,75 @@ async function stageNormalize(run_id, harvestResult) {
     };
   });
   
+  // Step 2: Call AI deduplication if we have too many benefits
+  if (normalizedBenefits.length > MAX_BENEFITS) {
+    console.log(`     🤖 Calling AI deduplication (${normalizedBenefits.length} -> max ${MAX_BENEFITS})...`);
+    
+    try {
+      const response = await fetch(DEDUPE_FUNCTION_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
+        },
+        body: JSON.stringify({
+          benefits: normalizedBenefits,
+          maxBenefits: MAX_BENEFITS
+        }),
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        if (data.benefits && Array.isArray(data.benefits)) {
+          console.log(`     ✓ AI deduplication: ${normalizedBenefits.length} -> ${data.benefits.length} (${data.method})`);
+          normalizedBenefits = data.benefits;
+        }
+      } else {
+        console.warn(`     ⚠️ Deduplication failed (${response.status}), using fallback`);
+        // Fallback: simple truncation with basic dedup
+        normalizedBenefits = fallbackDeduplication(normalizedBenefits, MAX_BENEFITS);
+      }
+    } catch (err) {
+      console.warn(`     ⚠️ Deduplication error: ${err.message}, using fallback`);
+      normalizedBenefits = fallbackDeduplication(normalizedBenefits, MAX_BENEFITS);
+    }
+  }
+  
   console.log(`     ✓ Normalized ${normalizedBenefits.length} benefits`);
   return { ...harvestResult, normalizedBenefits };
+}
+
+/**
+ * Fallback deduplication when AI is unavailable
+ */
+function fallbackDeduplication(benefits, maxCount) {
+  const seen = new Map();
+  
+  for (const benefit of benefits) {
+    // Create a normalized key from first 50 chars of title
+    const key = (benefit.title || '')
+      .substring(0, 50)
+      .toLowerCase()
+      .replace(/[^\u0590-\u05FFa-z0-9]/g, '');
+    
+    if (!seen.has(key)) {
+      seen.set(key, benefit);
+    } else {
+      // Merge evidence spans from duplicate
+      const existing = seen.get(key);
+      const newSpans = benefit.evidence_set?.spans || [];
+      existing.evidence_set.spans = [
+        ...existing.evidence_set.spans,
+        ...newSpans.filter(ns => 
+          !existing.evidence_set.spans.some(es => es.quote === ns.quote)
+        )
+      ];
+    }
+    
+    if (seen.size >= maxCount) break;
+  }
+  
+  return Array.from(seen.values());
 }
 
 async function stageValidate(run_id, normalizeResult) {
