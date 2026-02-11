@@ -1,5 +1,6 @@
 /**
  * Insurance Policy Processing Worker
+ * Version: 2.1.0
  * 
  * Complete worker with clause-level citation extraction.
  * Polls Redis queue and processes policy documents through 6-stage pipeline.
@@ -10,6 +11,8 @@
  * - 6-stage pipeline: Intake → Map → Harvest → Normalize → Validate → Export
  * - Clause-level citations with document/page/section/quote
  */
+
+const WORKER_VERSION = "2.1.0";
 
 import { createClient } from '@supabase/supabase-js';
 import { Redis } from '@upstash/redis';
@@ -1233,8 +1236,8 @@ async function stageHarvest(run_id, mapResult) {
   return { ...mapResult, benefits };
 }
 
-// Maximum benefits to process (prevents runaway extraction)
-const MAX_BENEFITS = 200;
+// Maximum benefits before triggering AI dedup (raised to avoid unnecessary AI calls)
+const MAX_BENEFITS = 500;
 
 // Supabase Edge Function URL for AI-powered deduplication
 const DEDUPE_FUNCTION_URL = `${SUPABASE_URL}/functions/v1/dedupe-benefits`;
@@ -1277,7 +1280,14 @@ async function stageNormalize(run_id, harvestResult) {
     };
   });
   
-  // Step 2: Call AI deduplication if we have too many benefits
+  // Step 2: Always run local fuzzy dedup first (fast, no network)
+  const beforeFuzzy = normalizedBenefits.length;
+  normalizedBenefits = fuzzyDeduplication(normalizedBenefits);
+  if (normalizedBenefits.length < beforeFuzzy) {
+    console.log(`     🔄 Fuzzy dedup: ${beforeFuzzy} -> ${normalizedBenefits.length}`);
+  }
+  
+  // Step 3: Only call AI deduplication if still over the cap
   if (normalizedBenefits.length > MAX_BENEFITS) {
     console.log(`     🤖 Calling AI deduplication (${normalizedBenefits.length} -> max ${MAX_BENEFITS})...`);
     
@@ -1302,7 +1312,6 @@ async function stageNormalize(run_id, harvestResult) {
         }
       } else {
         console.warn(`     ⚠️ Deduplication failed (${response.status}), using fallback`);
-        // Fallback: simple truncation with basic dedup
         normalizedBenefits = fallbackDeduplication(normalizedBenefits, MAX_BENEFITS);
       }
     } catch (err) {
@@ -1313,6 +1322,50 @@ async function stageNormalize(run_id, harvestResult) {
   
   console.log(`     ✓ Normalized ${normalizedBenefits.length} benefits`);
   return { ...harvestResult, normalizedBenefits };
+}
+
+/**
+ * Fuzzy deduplication - catches near-duplicates by normalizing titles more aggressively
+ * Runs locally, no network calls, very fast
+ */
+function fuzzyDeduplication(benefits) {
+  const seen = new Map();
+  
+  for (const benefit of benefits) {
+    // Aggressive normalization: strip punctuation, numbers, whitespace, common prefixes
+    const key = (benefit.title || '')
+      .replace(/[""״׳'`\-–—:;,.\u200F\u200E]/g, '')  // Remove punctuation & bidi marks
+      .replace(/\d+/g, '')                              // Remove numbers
+      .replace(/\s+/g, '')                               // Remove whitespace
+      .toLowerCase()
+      .replace(/^(כיסוי|זכות|שירות|הטבה|ביטוח)/g, '')   // Strip common Hebrew prefixes
+      .substring(0, 40);
+    
+    if (!key) continue;
+    
+    if (!seen.has(key)) {
+      seen.set(key, benefit);
+    } else {
+      // Merge: keep longer summary, merge evidence spans
+      const existing = seen.get(key);
+      if ((benefit.summary || '').length > (existing.summary || '').length) {
+        existing.summary = benefit.summary;
+      }
+      const newSpans = benefit.evidence_set?.spans || [];
+      existing.evidence_set.spans = [
+        ...existing.evidence_set.spans,
+        ...newSpans.filter(ns => 
+          !existing.evidence_set.spans.some(es => es.quote === ns.quote)
+        )
+      ];
+      // Merge tags
+      if (benefit.tags?.length) {
+        existing.tags = [...new Set([...(existing.tags || []), ...benefit.tags])];
+      }
+    }
+  }
+  
+  return Array.from(seen.values());
 }
 
 /**
@@ -1548,7 +1601,7 @@ async function processPolicyPipeline(run_id) {
 async function processJob(job) {
   const { run_id, attempt = 1 } = job;
   
-  console.log(`\n🔄 Processing job: ${run_id} (attempt ${attempt}/${MAX_RETRIES})`);
+  console.log(`\n🔄 Processing job: ${run_id} (attempt ${attempt}/${MAX_RETRIES}) [Worker ${WORKER_VERSION}]`);
   
   try {
     // Verify run exists
