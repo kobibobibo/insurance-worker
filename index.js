@@ -878,6 +878,115 @@ function extractAmounts(text, hasSchedule) {
 }
 
 /**
+ * Generate a concise, human-readable benefit title from a raw policy paragraph.
+ * Strips clause numbers, legal boilerplate prefixes, and extracts the core right description.
+ */
+function generateBenefitTitle(paragraph) {
+  let text = paragraph;
+  
+  // Strip leading clause/section numbers: "15.1.3.", "סעיף 3.2", "א.", "1)", etc.
+  text = text.replace(/^[\s]*(?:סעיף\s*)?[\d\u05D0-\u05EA]+(?:[.\-)\s]+[\d\u05D0-\u05EA]+)*[.\-)\s]+/, '');
+  
+  // Strip common legal boilerplate prefixes
+  const boilerplatePrefixes = [
+    /^הפוליסה\.\s*/,
+    /^בכפוף\s+לתנאי\s+הפוליסה[,\s]*/,
+    /^בהתאם\s+לתנאי\s+הפוליסה[,\s]*/,
+    /^מוסכם\s+בזה\s+כי\s*/,
+    /^הוסכם\s+כי\s*/,
+    /^נקבע\s+כי\s*/,
+    /^למען\s+הסר\s+ספק[,\s]*/,
+  ];
+  for (const prefix of boilerplatePrefixes) {
+    text = text.replace(prefix, '');
+  }
+  
+  text = text.trim();
+  
+  // Try to find a heading-like first segment (before the first period that ends a sentence)
+  // A heading is typically short and describes the topic
+  const headingMatch = text.match(/^(.{10,60}?)(?:\.\s|\n)/);
+  if (headingMatch) {
+    const candidate = headingMatch[1].trim();
+    // Only use if it looks like a heading (not too long, not just clause refs)
+    if (candidate.length >= 10 && candidate.length <= 60) {
+      return normalizeHebrewText(candidate);
+    }
+  }
+  
+  // Try to extract the core right by finding right-conferring verb phrases
+  const rightPhrases = [
+    /(?:זכ(?:אי|ות)\s+ל)(.{5,50}?)(?:[,.]|$)/,
+    /(?:יהיה\s+זכאי\s+ל)(.{5,50}?)(?:[,.]|$)/,
+    /(?:זכות\s+ל)(.{5,50}?)(?:[,.]|$)/,
+    /(?:כיסוי\s+(?:ל|בגין)\s*)(.{5,50}?)(?:[,.]|$)/,
+    /(?:פיצוי\s+(?:ל|בגין|בשל)\s*)(.{5,50}?)(?:[,.]|$)/,
+    /(?:שיפוי\s+(?:ל|בגין|בשל)\s*)(.{5,50}?)(?:[,.]|$)/,
+    /(?:החזר\s+(?:ל|בגין)\s*)(.{5,50}?)(?:[,.]|$)/,
+    /(?:תגמולים?\s+(?:ל|בגין|בשל)\s*)(.{5,50}?)(?:[,.]|$)/,
+    /(?:הודעה\s+(?:ל|בדבר|על)\s*)(.{5,50}?)(?:[,.]|$)/,
+    /(?:ביטול|סיום|הפסקה|שינוי)\s+(?:ה)?(.{5,40}?)(?:[,.]|$)/,
+  ];
+  
+  for (const pattern of rightPhrases) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      const phrase = match[0].trim().replace(/[,.]$/, '');
+      if (phrase.length >= 10 && phrase.length <= 70) {
+        return normalizeHebrewText(phrase);
+      }
+    }
+  }
+  
+  // Fallback: take first meaningful segment up to a natural break
+  let fallback = text.substring(0, 80);
+  const breakMatch = fallback.match(/^(.{15,70}?)[,:\-–—;]/);
+  if (breakMatch) {
+    return normalizeHebrewText(breakMatch[1].trim());
+  }
+  
+  // Last resort: word boundary at ~60 chars
+  const lastSpace = fallback.substring(0, 60).lastIndexOf(' ');
+  if (lastSpace > 20) {
+    return normalizeHebrewText(fallback.substring(0, lastSpace));
+  }
+  
+  return normalizeHebrewText(fallback.trim());
+}
+
+/**
+ * Generate a concise summary (max ~200 chars) from a raw policy paragraph.
+ * Strips clause numbers, trims to sentence boundaries, and avoids dumping raw text.
+ */
+function generateBenefitSummary(paragraph) {
+  let text = paragraph;
+  
+  // Strip leading clause numbers
+  text = text.replace(/^[\s]*(?:סעיף\s*)?[\d\u05D0-\u05EA]+(?:[.\-)\s]+[\d\u05D0-\u05EA]+)*[.\-)\s]+/, '');
+  text = text.replace(/^הפוליסה\.\s*/, '');
+  text = text.trim();
+  
+  // If short enough, return as-is
+  if (text.length <= 200) {
+    return normalizeHebrewText(text);
+  }
+  
+  // Try to cut at a sentence boundary within first 200 chars
+  const sentenceEnd = text.substring(0, 200).lastIndexOf('.');
+  if (sentenceEnd > 80) {
+    return normalizeHebrewText(text.substring(0, sentenceEnd + 1));
+  }
+  
+  // Cut at last word boundary within 200 chars
+  const lastSpace = text.substring(0, 200).lastIndexOf(' ');
+  if (lastSpace > 80) {
+    return normalizeHebrewText(text.substring(0, lastSpace) + '...');
+  }
+  
+  return normalizeHebrewText(text.substring(0, 200) + '...');
+}
+
+/**
  * Extract benefits using paragraph-based chunking to keep complete thoughts together.
  * Instead of splitting on every sentence, we split on paragraph breaks (double newlines
  * or heading patterns) and keep each clause as a single benefit.
@@ -915,19 +1024,8 @@ function extractBenefits(text, documentId, pageTexts, displayName, docType, hasS
     if (foundQuotes.has(normalizedKey)) continue;
     foundQuotes.add(normalizedKey);
     
-    // Generate a concise title from the paragraph
-    // Try to find a natural break point (comma, dash, colon) within first 80 chars
-    let title = paragraph.substring(0, 80);
-    const breakMatch = title.match(/^(.{20,70}?)[,:\-–—]/);
-    if (breakMatch) {
-      title = breakMatch[1].trim();
-    } else if (title.length === 80) {
-      // Find last word boundary
-      const lastSpace = title.lastIndexOf(' ');
-      if (lastSpace > 40) {
-        title = title.substring(0, lastSpace) + '...';
-      }
-    }
+    // Generate a concise, human-readable title from the paragraph
+    const title = generateBenefitTitle(paragraph);
     
     // Find which page this paragraph is on
     let page = 1;
@@ -966,7 +1064,7 @@ function extractBenefits(text, documentId, pageTexts, displayName, docType, hasS
       benefit_id: benefitId,
       layer: detectBenefitLayer(paragraph),
       title: normalizeHebrewText(title),
-      summary: normalizeHebrewText(paragraph),
+      summary: generateBenefitSummary(paragraph),
       status: benefitStatus,
       evidence_set: {
         spans: [evidenceSpan]
