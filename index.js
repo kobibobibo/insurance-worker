@@ -402,8 +402,18 @@ function extractPolicyMetadata(documents) {
     for (const pattern of METADATA_PATTERNS.insuredName) {
       const match = textToSearch.match(pattern);
       if (match) {
-        metadata.insuredName = match[1].trim();
-        break;
+        const candidate = match[1].trim();
+        // Validate: reject if too long (>30 chars), contains common non-name Hebrew words,
+        // or has more than 4 words (real names are 2-4 words)
+        const wordCount = candidate.split(/\s+/).filter(w => w.length > 0).length;
+        const invalidNamePatterns = /(?:זכאים|כיסויים|בתחום|הרפואה|הפרט|ביטוח|פוליסה|תנאים|חריגים|הגדרות|המבטח|החברה|תביעה|סעיף|פרק|כיסוי|תשלום|שיפוי|החזר|נספח)/;
+        if (wordCount >= 2 && wordCount <= 4 && candidate.length <= 30 && !invalidNamePatterns.test(candidate)) {
+          metadata.insuredName = candidate;
+          console.log(`[extractPolicyMetadata] Found insured name: ${metadata.insuredName}`);
+          break;
+        } else {
+          console.log(`[extractPolicyMetadata] Rejected insuredName candidate: "${candidate}" (words=${wordCount}, len=${candidate.length})`);
+        }
       }
     }
   }
@@ -1521,7 +1531,54 @@ function fuzzyDeduplication(benefits) {
     }
   }
   
-  return Array.from(seen.values());
+  // Cap evidence spans to max 5 per benefit for cleaner UI
+  const MAX_EVIDENCE = 5;
+  const results = Array.from(seen.values());
+  for (const b of results) {
+    if (b.evidence_set?.spans?.length > MAX_EVIDENCE) {
+      b.evidence_set.spans = capEvidenceSpansWorker(b.evidence_set.spans, MAX_EVIDENCE);
+    }
+  }
+  return results;
+}
+
+/**
+ * Cap evidence spans: deduplicate by quote, then round-robin across documents for diversity.
+ */
+function capEvidenceSpansWorker(spans, max) {
+  // Deduplicate
+  const seen = new Set();
+  const unique = spans.filter(s => {
+    const q = (s.quote || '').trim();
+    if (!q || seen.has(q)) return false;
+    seen.add(q);
+    return true;
+  });
+  if (unique.length <= max) return unique;
+
+  // Group by document, sort by page within each
+  const byDoc = new Map();
+  for (const s of unique) {
+    const docId = s.document_id || '_';
+    if (!byDoc.has(docId)) byDoc.set(docId, []);
+    byDoc.get(docId).push(s);
+  }
+  for (const arr of byDoc.values()) {
+    arr.sort((a, b) => (a.page || 0) - (b.page || 0));
+  }
+
+  // Round-robin for diversity
+  const result = [];
+  const iters = Array.from(byDoc.values()).map(arr => ({ arr, idx: 0 }));
+  while (result.length < max) {
+    let added = false;
+    for (const it of iters) {
+      if (result.length >= max) break;
+      if (it.idx < it.arr.length) { result.push(it.arr[it.idx]); it.idx++; added = true; }
+    }
+    if (!added) break;
+  }
+  return result;
 }
 
 /**
@@ -1554,7 +1611,14 @@ function fallbackDeduplication(benefits, maxCount) {
     if (seen.size >= maxCount) break;
   }
   
-  return Array.from(seen.values());
+  // Cap evidence spans
+  const results = Array.from(seen.values());
+  for (const b of results) {
+    if (b.evidence_set?.spans?.length > 5) {
+      b.evidence_set.spans = capEvidenceSpansWorker(b.evidence_set.spans, 5);
+    }
+  }
+  return results;
 }
 
 async function stageValidate(run_id, normalizeResult) {
