@@ -12,7 +12,7 @@
  * - Clause-level citations with document/page/section/quote
  */
 
-const WORKER_VERSION = "2.1.0";
+const WORKER_VERSION = "2.2.0";
 
 import { createClient } from '@supabase/supabase-js';
 import { Redis } from '@upstash/redis';
@@ -167,17 +167,22 @@ const ANNEX_PATTERNS = {
 // ============================================================
 
 const METADATA_PATTERNS = {
-  // Policy number patterns
+  // Policy number patterns — includes reversed RTL proximity patterns
   policyNumber: [
-    /(?:מספר פוליסה|פוליסה מס['"]?|פוליסה)[:\s]*([A-Z0-9\-\/]+)/i,
+    /(?:מספר\s+פוליסה|פוליסה\s+מס(?:פר)?['"]?|פוליסה\s+מספר)[:\s]*([A-Z0-9\-\/]+)/i,
     /(?:policy\s*(?:no\.?|number|#))[:\s]*([A-Z0-9\-\/]+)/i,
     /פוליסה\s*[:\s]\s*(\d{6,15})/,
     /(?:מס['\.]?\s*פוליסה)[:\s]*([A-Z0-9\-\/]+)/i,
+    // Reversed RTL: number appears near "פוליסה" or "לביטוח" within ~80 chars
+    /(\d{6,15})\s+[^\n]{0,60}(?:פוליסה|לביטוח\s+פוליסה)/,
+    /(?:פוליסה|לביטוח\s+פוליסה)[^\n]{0,60}\s+(\d{6,15})/,
+    // "הסרג" (reversed "גרסה") near a number — common in OCR'd Hebrew
+    /(\d{5,15})[\.\s]+הסרג/,
   ],
   // Insurer name patterns (Israeli insurers)
   insurerName: [
     /(הראל(?:\s+ביטוח)?)/,
-    /(מגדל(?:\s+ביטוח)?)/,
+    /(מגדל(?:\s+(?:חברה\s+)?ביטוח)?)/,
     /(כלל(?:\s+ביטוח)?)/,
     /(הפניקס(?:\s+ביטוח)?)/,
     /(מנורה(?:\s+מבטחים)?)/,
@@ -185,33 +190,46 @@ const METADATA_PATTERNS = {
     /(הכשרה(?:\s+ביטוח)?)/,
     /(שלמה(?:\s+ביטוח)?)/,
     /(ביטוח\s+ישיר)/,
+    // Reversed OCR forms
+    /(הרונמ)/, // reversed "מנורה"
+    /(לדגמ)/, // reversed "מגדל"
+    /(לארה)/, // reversed "הראל"
     /(AIG|Clal|Phoenix|Migdal|Harel|Menora)/i,
   ],
   // Policy type patterns - returns normalized type key
+  // Added reversed RTL variants: "תואירב חוטיב" = reversed "ביטוח בריאות"
   policyType: [
-    // Health insurance - multiple variations
-    { pattern: /ביטוח\s+בריאות|בריאות\s+פרט|כיסוי\s+בריאות|health\s+insurance/i, type: 'health' },
-    // Life insurance
+    { pattern: /ביטוח\s+בריאות|בריאות\s+(?:פרט|ביטוח)|קבוצתי\s+בריאות|תואירב\s+חוטיב|health\s+insurance/i, type: 'health' },
     { pattern: /ביטוח\s+חיים|חיים\s+ומוות|life\s+insurance/i, type: 'life' },
-    // Nursing/Long-term care
     { pattern: /ביטוח\s+סיעודי|סיעוד|nursing\s+(?:care\s+)?insurance|long[- ]?term\s+care/i, type: 'nursing' },
-    // Disability/Loss of work capacity
     { pattern: /אובדן\s+כושר\s+עבודה|אובדן\s+כושר|אכ"ע|disability\s+insurance|income\s+protection/i, type: 'disability' },
-    // Personal accident
     { pattern: /ביטוח\s+תאונות(?:\s+אישיות)?|תאונות\s+אישיות|accident\s+insurance|personal\s+accident/i, type: 'accident' },
-    // Travel insurance
     { pattern: /ביטוח\s+נסיעות|נסיעות\s+לחו"ל|travel\s+insurance/i, type: 'travel' },
-    // Car insurance (for future use)
     { pattern: /ביטוח\s+רכב|car\s+insurance|motor\s+insurance/i, type: 'car' },
-    // Home insurance (for future use)
     { pattern: /ביטוח\s+דירה|home\s+insurance/i, type: 'home' },
   ],
-  // Date patterns (for policy start/end)
-  policyDates: [
+  // Start date patterns — standard + reversed RTL
+  policyStartDates: [
     /(?:תאריך\s+(?:תחילת?\s+)?תוקף|מיום|תחילה)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/,
     /(?:effective\s+(?:from|date))[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/i,
     /(?:valid\s+from)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/i,
+    // "החל מ-01.04.2021" or "01.04.2021 - מה החל"
+    /(?:החל\s+(?:מ[:\-\s]?|מיום\s+))(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/,
+    /(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})\s*[-–]\s*מה?\s+החל/,
+    // Reversed: "date םוימ לחה" or "date מיום ... תחל"
+    /(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})\s+םוימ\s+לחה/,
+    /(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})\s+מיום\s+[^\n]{0,40}תחל/,
+    // "from DATE" pattern in table-like contexts
+    /(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})\s*(?:םוימ|מיום|מ-|מ\s)/,
+  ],
+  // End date patterns — standard + reversed RTL  
+  policyEndDates: [
     /(?:תאריך\s+סיום|עד\s+ליום|תום\s+תוקף)[:\s]*(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/,
+    // "עד 31.03.2026" or "31.03.2026 עד"
+    /עד\s+(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})/,
+    /(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})\s*(?:עד|דעו|ביום\s+לסיומה)/,
+    // Reversed: "date םויל דעו"
+    /(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})\s+םויל\s+דעו/,
   ],
   // Insured name patterns
   insuredName: [
@@ -327,17 +345,26 @@ function extractPolicyMetadata(documents) {
     for (const pattern of METADATA_PATTERNS.insurerName) {
       const match = textToSearch.match(pattern);
       if (match) {
-        metadata.insurerName = match[1].trim();
+        // Map reversed OCR forms back to correct names
+        const reversedMap = { 'הרונמ': 'מנורה', 'לדגמ': 'מגדל', 'לארה': 'הראל' };
+        const raw = match[1].trim();
+        metadata.insurerName = reversedMap[raw] || raw;
+        console.log(`[extractPolicyMetadata] Found insurer: ${metadata.insurerName}`);
         break;
       }
     }
     
-    // Extract policy number
+    // Extract policy number with validation
     for (const pattern of METADATA_PATTERNS.policyNumber) {
       const match = textToSearch.match(pattern);
       if (match) {
-        metadata.policyNumber = match[1].trim();
-        break;
+        const candidate = match[1].trim();
+        // Reject placeholders: "-", "0", "00", "N/A", single chars, etc.
+        if (candidate.length >= 3 && !/^[-0]+$/.test(candidate) && !/^(N\/A|none|unknown)$/i.test(candidate)) {
+          metadata.policyNumber = candidate;
+          console.log(`[extractPolicyMetadata] Found policy number: ${metadata.policyNumber}`);
+          break;
+        }
       }
     }
     
@@ -345,24 +372,29 @@ function extractPolicyMetadata(documents) {
     for (const typePattern of METADATA_PATTERNS.policyType) {
       const match = textToSearch.match(typePattern.pattern);
       if (match) {
-        metadata.policyType = typePattern.type; // Use normalized key like 'health', 'life', etc.
+        metadata.policyType = typePattern.type;
         console.log(`[extractPolicyMetadata] Found policy type: ${typePattern.type} from match: ${match[0]}`);
         break;
       }
     }
     
-    // Extract dates
-    const dateMatches = [];
-    for (const pattern of METADATA_PATTERNS.policyDates) {
+    // Extract start date (separate from end date)
+    for (const pattern of METADATA_PATTERNS.policyStartDates) {
       const match = textToSearch.match(pattern);
       if (match) {
-        dateMatches.push(match[1]);
+        metadata.policyStartDate = formatDateForForm(match[1]);
+        console.log(`[extractPolicyMetadata] Found start date: ${metadata.policyStartDate}`);
+        break;
       }
     }
-    if (dateMatches.length > 0) {
-      metadata.policyStartDate = formatDateForForm(dateMatches[0]);
-      if (dateMatches.length > 1) {
-        metadata.policyEndDate = formatDateForForm(dateMatches[1]);
+    
+    // Extract end date
+    for (const pattern of METADATA_PATTERNS.policyEndDates) {
+      const match = textToSearch.match(pattern);
+      if (match) {
+        metadata.policyEndDate = formatDateForForm(match[1]);
+        console.log(`[extractPolicyMetadata] Found end date: ${metadata.policyEndDate}`);
+        break;
       }
     }
     
