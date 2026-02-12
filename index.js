@@ -896,23 +896,14 @@ function generateBenefitTitle(paragraph) {
     /^הוסכם\s+כי\s*/,
     /^נקבע\s+כי\s*/,
     /^למען\s+הסר\s+ספק[,\s]*/,
+    /^פסקה\s+/,
+    /^כאמור\s+ב/,
   ];
   for (const prefix of boilerplatePrefixes) {
     text = text.replace(prefix, '');
   }
   
   text = text.trim();
-  
-  // Try to find a heading-like first segment (before the first period that ends a sentence)
-  // A heading is typically short and describes the topic
-  const headingMatch = text.match(/^(.{10,60}?)(?:\.\s|\n)/);
-  if (headingMatch) {
-    const candidate = headingMatch[1].trim();
-    // Only use if it looks like a heading (not too long, not just clause refs)
-    if (candidate.length >= 10 && candidate.length <= 60) {
-      return normalizeHebrewText(candidate);
-    }
-  }
   
   // Try to extract the core right by finding right-conferring verb phrases
   const rightPhrases = [
@@ -930,7 +921,7 @@ function generateBenefitTitle(paragraph) {
   
   for (const pattern of rightPhrases) {
     const match = text.match(pattern);
-    if (match && match[1]) {
+    if (match && match[0]) {
       const phrase = match[0].trim().replace(/[,.]$/, '');
       if (phrase.length >= 10 && phrase.length <= 70) {
         return normalizeHebrewText(phrase);
@@ -938,19 +929,49 @@ function generateBenefitTitle(paragraph) {
     }
   }
   
-  // Fallback: take first meaningful segment up to a natural break
-  let fallback = text.substring(0, 80);
-  const breakMatch = fallback.match(/^(.{15,70}?)[,:\-–—;]/);
-  if (breakMatch) {
-    return normalizeHebrewText(breakMatch[1].trim());
+  // Try to find the first complete sentence (ends with period followed by space)
+  const sentenceMatch = text.match(/^(.{15,70}?)\.\s/);
+  if (sentenceMatch) {
+    return normalizeHebrewText(sentenceMatch[1].trim());
   }
   
-  // Last resort: word boundary at ~60 chars
-  const lastSpace = fallback.substring(0, 60).lastIndexOf(' ');
-  if (lastSpace > 20) {
-    return normalizeHebrewText(fallback.substring(0, lastSpace));
+  // Fallback: extract key noun phrases describing the right
+  // Look for common insurance topic markers
+  const topicMarkers = [
+    /(?:ביטוח\s+\S+(?:\s+\S+)?)/,
+    /(?:דמי\s+ביטוח)/,
+    /(?:תקופת\s+(?:ה)?(?:ביטוח|אכשרה|המתנה))/,
+    /(?:בית\s+חולים\s+\S+)/,
+    /(?:רופא\s+מומחה)/,
+    /(?:טיפול\s+\S+)/,
+    /(?:ניתוח\s+\S*)/,
+    /(?:תרופות?\s+\S*)/,
+    /(?:אשפוז\s+\S*)/,
+  ];
+  
+  for (const marker of topicMarkers) {
+    const match = text.match(marker);
+    if (match) {
+      // Build a title around this topic marker with some context
+      const idx = text.indexOf(match[0]);
+      const start = Math.max(0, text.lastIndexOf(' ', Math.max(0, idx - 15)) + 1);
+      const end = Math.min(text.length, idx + match[0].length + 20);
+      let candidate = text.substring(start, end);
+      // Trim to word boundary
+      const lastSp = candidate.lastIndexOf(' ');
+      if (lastSp > 10) candidate = candidate.substring(0, lastSp);
+      if (candidate.length >= 10 && candidate.length <= 60) {
+        return normalizeHebrewText(candidate.trim());
+      }
+    }
   }
   
+  // Last resort: first sentence fragment up to a natural break
+  let fallback = text.substring(0, 60);
+  const lastSpace = fallback.lastIndexOf(' ');
+  if (lastSpace > 15) {
+    fallback = fallback.substring(0, lastSpace);
+  }
   return normalizeHebrewText(fallback.trim());
 }
 
@@ -1024,9 +1045,6 @@ function extractBenefits(text, documentId, pageTexts, displayName, docType, hasS
     if (foundQuotes.has(normalizedKey)) continue;
     foundQuotes.add(normalizedKey);
     
-    // Generate a concise, human-readable title from the paragraph
-    const title = generateBenefitTitle(paragraph);
-    
     // Find which page this paragraph is on
     let page = 1;
     let pageText = text;
@@ -1050,6 +1068,14 @@ function extractBenefits(text, documentId, pageTexts, displayName, docType, hasS
       page,
       0.85
     );
+    
+    // Use the evidence heading as the primary title source (it's the nearest
+    // section heading and is almost always a clean, human-readable phrase).
+    // Fall back to regex-based extraction only if no heading was found.
+    const headingTitle = evidenceSpan.heading_title;
+    const title = (headingTitle && headingTitle.length >= 5 && headingTitle.length <= 80)
+      ? headingTitle
+      : generateBenefitTitle(paragraph);
     
     // Detect if this is an included benefit or an exclusion
     const benefitId = uuidv4();
