@@ -173,11 +173,17 @@ const METADATA_PATTERNS = {
     /(?:policy\s*(?:no\.?|number|#))[:\s]*([A-Z0-9\-\/]+)/i,
     /פוליסה\s*[:\s]\s*(\d{6,15})/,
     /(?:מס['\.]?\s*פוליסה)[:\s]*([A-Z0-9\-\/]+)/i,
-    // Reversed RTL: number appears near "פוליסה" or "לביטוח" within ~80 chars
+    // Reversed RTL: number appears near "פוליסה" or "לביטוח פוליסה" within ~80 chars
     /(\d{6,15})\s+[^\n]{0,60}(?:פוליסה|לביטוח\s+פוליסה)/,
     /(?:פוליסה|לביטוח\s+פוליסה)[^\n]{0,60}\s+(\d{6,15})/,
     // "הסרג" (reversed "גרסה") near a number — common in OCR'd Hebrew
     /(\d{5,15})[\.\s]+הסרג/,
+    // "הסילופ" (reversed "פוליסה") near a number — targeted reversed OCR
+    /(\d{6,15})\s+[^\n]{0,40}הסילופ/,
+    /הסילופ[^\n]{0,40}\s+(\d{6,15})/,
+    // "הסילופה רפסמ" (reversed "מספר הפוליסה") — very specific
+    /הסילופה\s+רפסמ[:\s]*(\d{6,15})/,
+    /(\d{6,15})\s+הסילופה\s+רפסמ/,
   ],
   // Insurer name patterns (Israeli insurers)
   insurerName: [
