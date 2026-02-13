@@ -1505,7 +1505,7 @@ function fuzzyDeduplication(benefits) {
       .replace(/\s+/g, '')                               // Remove whitespace
       .toLowerCase()
       .replace(/^(כיסוי|זכות|שירות|הטבה|ביטוח)/g, '')   // Strip common Hebrew prefixes
-      .substring(0, 40);
+      .substring(0, 30);
     
     if (!key) continue;
     
@@ -1531,8 +1531,8 @@ function fuzzyDeduplication(benefits) {
     }
   }
   
-  // Cap evidence spans to max 5 per benefit for cleaner UI
-  const MAX_EVIDENCE = 5;
+  // Cap evidence spans to max 3 per benefit for cleaner UI
+  const MAX_EVIDENCE = 3;
   const results = Array.from(seen.values());
   for (const b of results) {
     if (b.evidence_set?.spans?.length > MAX_EVIDENCE) {
